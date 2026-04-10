@@ -1,0 +1,1 @@
+ALTER TABLE public.agent_traces ADD COLUMN agent_source text NOT NULL DEFAULT 'comp_agent';

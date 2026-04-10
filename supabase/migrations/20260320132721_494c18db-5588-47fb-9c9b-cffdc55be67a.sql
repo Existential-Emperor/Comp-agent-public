@@ -1,0 +1,1 @@
+UPDATE public.media_assets SET is_active = false WHERE id IN ('bc2b1a3b-320b-4ff8-baf8-053066376c07', '827b38d3-5659-43cc-80eb-5f8180c596dc', 'd7c0bc40-2b9b-40b1-af8b-7c184cf58d3f', '436c6d62-8fce-4e90-a135-0136751316f3');

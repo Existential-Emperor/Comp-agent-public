@@ -1,0 +1,1 @@
+DELETE FROM news_items WHERE source_name ILIKE '%workday adaptive%' OR source_name ILIKE '%adaptive planning%';

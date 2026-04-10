@@ -1,0 +1,1 @@
+UPDATE news_items SET image_url = 'https://www.google.com/s2/favicons?domain=' || split_part(split_part(source_url, '://', 2), '/', 1) || '&sz=128' WHERE image_url IS NULL;

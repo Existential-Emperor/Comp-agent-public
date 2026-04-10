@@ -1,0 +1,46 @@
+project_id = "icrhvwwvymbqvudmpwky"
+
+[functions.chat-analysis]
+verify_jwt = false
+
+[functions.discover-competitors]
+verify_jwt = false
+
+[functions.admin-traces]
+verify_jwt = false
+
+[functions.trace-feedback]
+verify_jwt = false
+
+[functions.crawl-competitor-pages]
+verify_jwt = false
+
+[functions.ambient-crawler]
+verify_jwt = false
+
+[functions.media-quality-agent]
+verify_jwt = false
+
+[functions.firecrawl-diagnostics]
+verify_jwt = false
+
+[functions.cleanup-raw-content]
+verify_jwt = false
+
+[functions.bulk-media-crawl]
+verify_jwt = false
+
+[functions.refresh-media-cdns]
+verify_jwt = false
+
+[functions.quick-media-extract]
+verify_jwt = false
+
+[functions.persist-media]
+verify_jwt = false
+
+[functions.scheduled-media-refresh]
+verify_jwt = false
+
+[functions.migrate-cdn-to-storage]
+verify_jwt = false

@@ -1,0 +1,1 @@
+UPDATE news_items SET image_url = NULL WHERE image_url LIKE '%google.com/s2/favicons%';

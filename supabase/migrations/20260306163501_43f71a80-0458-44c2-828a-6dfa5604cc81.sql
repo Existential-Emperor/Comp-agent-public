@@ -1,0 +1,1 @@
+UPDATE public.news_items SET image_url = NULL WHERE item_type = 'news';

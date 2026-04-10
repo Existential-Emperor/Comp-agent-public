@@ -1,0 +1,1 @@
+ALTER TABLE public.news_items ADD CONSTRAINT news_items_source_url_key UNIQUE (source_url);

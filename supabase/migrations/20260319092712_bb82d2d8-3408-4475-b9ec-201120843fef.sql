@@ -1,0 +1,1 @@
+UPDATE media_assets SET is_active = false WHERE competitor_name = 'OneStream' AND is_active = true AND product_sub_area IN ('Sales Planning', 'Consolidation', 'Web-Based Matrix Reporting', 'Drill-Through', 'Cell Notes & Audit Trail');

@@ -1,0 +1,1 @@
+UPDATE news_items SET image_url = REPLACE(image_url, '&amp;', '&') WHERE image_url LIKE '%&amp;%';
