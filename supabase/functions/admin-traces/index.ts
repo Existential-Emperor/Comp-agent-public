@@ -1,4 +1,3 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -19,9 +18,8 @@ Deno.serve(async (req) => {
       });
     }
 
-    const { createClient } = await import("jsr:@supabase/supabase-js@2");
+    const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2.45.0");
 
-    // Auth client to verify user
     const supabaseAuth = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -35,13 +33,11 @@ Deno.serve(async (req) => {
       });
     }
 
-    // Service role client to check admin & query traces
     const supabaseAdmin = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
 
-    // Check admin role
     const { data: roleData } = await supabaseAdmin
       .from("user_roles")
       .select("role")
@@ -60,7 +56,6 @@ Deno.serve(async (req) => {
     const action = url.searchParams.get("action") || "list";
 
     if (action === "list") {
-      // Query traces with filters
       const category = url.searchParams.get("category");
       const subCategory = url.searchParams.get("sub_category");
       const competitor = url.searchParams.get("competitor_name");
@@ -71,11 +66,12 @@ Deno.serve(async (req) => {
       const endDate = url.searchParams.get("end_date");
       const limit = parseInt(url.searchParams.get("limit") || "50");
       const offset = parseInt(url.searchParams.get("offset") || "0");
+      const sortAsc = url.searchParams.get("sort_asc") === "true";
 
       let query = supabaseAdmin
         .from("agent_traces")
         .select("*", { count: "exact" })
-        .order("created_at", { ascending: false })
+        .order("created_at", { ascending: sortAsc })
         .range(offset, offset + limit - 1);
 
       if (category) query = query.eq("category", category);
@@ -92,13 +88,31 @@ Deno.serve(async (req) => {
       const { data, error, count } = await query;
       if (error) throw error;
 
-      return new Response(JSON.stringify({ traces: data, total: count }), {
+      // Fetch profile emails for all unique user_ids
+      const userIds = [...new Set((data || []).map((t: any) => t.user_id))];
+      let profileMap: Record<string, string> = {};
+      if (userIds.length > 0) {
+        const { data: profiles } = await supabaseAdmin
+          .from("profiles")
+          .select("user_id, email")
+          .in("user_id", userIds);
+        for (const p of profiles || []) {
+          profileMap[p.user_id] = p.email || "";
+        }
+      }
+
+      // Attach login_username to each trace
+      const enrichedTraces = (data || []).map((t: any) => ({
+        ...t,
+        login_username: profileMap[t.user_id] || "",
+      }));
+
+      return new Response(JSON.stringify({ traces: enrichedTraces, total: count }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     if (action === "analytics") {
-      // Aggregate analytics
       const days = parseInt(url.searchParams.get("days") || "30");
       const since = new Date(Date.now() - days * 86400000).toISOString();
 
@@ -123,7 +137,6 @@ Deno.serve(async (req) => {
       const likes = traces?.filter((t: any) => t.feedback_vote === "like").length || 0;
       const dislikes = traces?.filter((t: any) => t.feedback_vote === "dislike").length || 0;
 
-      // Category breakdown
       const byCategory: Record<string, number> = {};
       for (const t of traces || []) {
         byCategory[t.category] = (byCategory[t.category] || 0) + 1;

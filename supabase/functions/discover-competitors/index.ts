@@ -1,5 +1,4 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { getProductAreaDescription } from "../_shared/product-areas.ts";
 import { firecrawlFetch, hasFirecrawlKey } from "../_shared/firecrawl-keys.ts";
 import { monitoredFetch } from "../_shared/monitored-fetch.ts";
@@ -169,12 +168,19 @@ Deno.serve(async (req) => {
       { global: { headers: { Authorization: authHeader } } }
     );
     const token = authHeader.replace('Bearer ', '');
-    const { data: claimsData, error: claimsError } = await supabaseAuth.auth.getClaims(token);
-    if (claimsError || !claimsData?.claims) {
+    const { data: userData, error: userError } = await supabaseAuth.auth.getUser(token);
+    if (userError || !userData?.user) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
     const { category, subCategory } = await req.json();
+    if (
+      typeof category !== "string" || typeof subCategory !== "string" ||
+      category.length < 1 || category.length > 200 ||
+      subCategory.length < 1 || subCategory.length > 200
+    ) {
+      return new Response(JSON.stringify({ error: "Invalid input" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
     const searchStartTime = Date.now();
 
     // ===== OPTIMIZATION A: Check cache first =====
@@ -268,10 +274,14 @@ Return JSON array: [{name, website, description}]. Max 20. Exclude Workday. ONLY
         const aiRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
-          body: JSON.stringify({ model: "google/gemini-2.5-flash-lite", messages: [{ role: "user", content: extractPrompt }] }),
+          body: JSON.stringify({ model: "openai/gpt-5.5", messages: [{ role: "user", content: extractPrompt }] }),
         });
 
         const aiData = await aiRes.json();
+       // @ts-ignore - hoisted var used later in trace insert
+       var discoverUsage: any = aiData.usage || {};
+       // @ts-ignore
+       var discoverSystemPrompt: any = extractPrompt;
         const content = aiData.choices?.[0]?.message?.content || "[]";
         try {
           const jsonMatch = content.match(/\[[\s\S]*\]/);
@@ -319,7 +329,7 @@ Return JSON array: [{name, website, description}]. Max 20. Exclude Workday. ONLY
           const aiRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
-            body: JSON.stringify({ model: "google/gemini-2.5-flash-lite", messages: [{ role: "user", content: extractPrompt }] }),
+            body: JSON.stringify({ model: "openai/gpt-5.5", messages: [{ role: "user", content: extractPrompt }] }),
           });
 
           const aiData = await aiRes.json();
@@ -346,7 +356,7 @@ Return JSON array: [{name, website, description}]. Max 20. ONLY JSON.`;
       const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
-        body: JSON.stringify({ model: "google/gemini-2.5-flash-lite", messages: [{ role: "user", content: prompt }] }),
+        body: JSON.stringify({ model: "openai/gpt-5.5", messages: [{ role: "user", content: prompt }] }),
       });
 
       const data = await response.json();
@@ -358,7 +368,7 @@ Return JSON array: [{name, website, description}]. Max 20. ONLY JSON.`;
     }
 
     // Store in database (fire-and-forget)
-    const userId = claimsData.claims.sub as string;
+    const userId = userData.user.id as string;
     const searchLatencyMs = Date.now() - searchStartTime;
 
     (async () => {
@@ -371,6 +381,14 @@ Return JSON array: [{name, website, description}]. Max 20. ONLY JSON.`;
           formatted_output: JSON.stringify(competitors.map(c => c.name)),
           raw_llm_output: JSON.stringify(competitors),
           user_prompt: `Discover competitors for ${subCategory} (${category})`,
+          system_prompt: typeof discoverSystemPrompt === 'string' ? discoverSystemPrompt : null,
+          model_used: "openai/gpt-5.5",
+          agent_source: "comp_agent",
+          prompt_tokens: typeof discoverUsage !== 'undefined' ? (discoverUsage.prompt_tokens || null) : null,
+          completion_tokens: typeof discoverUsage !== 'undefined' ? (discoverUsage.completion_tokens || null) : null,
+          total_tokens: typeof discoverUsage !== 'undefined' ? (discoverUsage.total_tokens || null) : null,
+          retrieved_documents: [],
+          tool_calls: [],
           metadata: { competitor_count: competitors.length, source: claudeRateLimited ? 'fallback' : 'claude_web_search' },
         });
 

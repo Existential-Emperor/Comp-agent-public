@@ -280,7 +280,7 @@ const SavedCommunityCard = ({ saved, onRemove }: { saved: SavedNewsItem; onRemov
                 {item.source_name}
               </span>
             )}
-            <span>{formatDate(item.published_at || item.fetched_at) || "Recent"}</span>
+            
           </div>
         </div>
       </a>

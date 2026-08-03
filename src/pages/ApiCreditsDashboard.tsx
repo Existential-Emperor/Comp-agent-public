@@ -102,13 +102,11 @@ const STATUS_CONFIG = {
 const SERVICE_COLORS: Record<string, string> = {
   firecrawl: "hsl(215, 90%, 58%)",
   anthropic: "hsl(280, 70%, 55%)",
-  tavily: "hsl(142, 70%, 45%)",
 };
 
 const SERVICE_ICONS: Record<string, string> = {
   firecrawl: "🔥",
   anthropic: "🤖",
-  tavily: "🔍",
 };
 
 const EVENT_TYPE_COLORS: Record<string, string> = {

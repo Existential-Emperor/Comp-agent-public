@@ -1,5 +1,5 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { requireAuth } from "../_shared/auth.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { firecrawlFetch, hasFirecrawlKey } from "../_shared/firecrawl-keys.ts";
 import { monitoredFetch } from "../_shared/monitored-fetch.ts";
 
@@ -168,8 +168,8 @@ async function classifyInlineImage(
   competitorName: string,
   imageUrl: string,
 ): Promise<boolean> {
-  const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!ANTHROPIC_API_KEY) {
+  const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
+  if (!LOVABLE_API_KEY) {
     // Without vision API, use a size heuristic
     return imageBytes.length > 30000;
   }
@@ -178,33 +178,33 @@ async function classifyInlineImage(
     let binary = "";
     for (let i = 0; i < imageBytes.length; i++) binary += String.fromCharCode(imageBytes[i]);
     const base64Data = btoa(binary);
+    const dataUrl = `data:image/png;base64,${base64Data}`;
 
-    const res = await monitoredFetch("https://api.anthropic.com/v1/messages", {
+    const res = await monitoredFetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
       method: "POST",
       headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
+        Authorization: `Bearer ${LOVABLE_API_KEY}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 30,
+        model: "openai/gpt-5.5",
+        max_completion_tokens: 500,
         messages: [{
           role: "user",
           content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: base64Data } },
+            { type: "image_url", image_url: { url: dataUrl } },
             {
               type: "text",
-              text: `Is this image from ${competitorName}'s product documentation worth keeping? Reply KEEP or SKIP.\n\nKEEP: Software UI screenshots, configuration panels, settings screens, setup wizards, connector forms, data import/export screens, dashboards, data grids, charts, workflow editors, integration setup pages, or any screen showing the actual product interface.\n\nSKIP: Logos only (no UI context), stock photos, abstract decorative illustrations, tiny icons, or pure text with no UI elements.`,
+              text: `Is this image from ${competitorName}'s product documentation worth keeping? Reply KEEP or SKIP.\n\nKEEP: Software UI screenshots, configuration panels, settings screens, setup wizards, connector forms, data import/export screens, dashboards, data grids, charts, workflow editors, integration setup pages, or any screen showing the actual product interface.\n\nSKIP: Logos only (no UI context), stock photos, abstract decorative illustrations (lightbulbs, gears, networks, circuits, gradient backgrounds), tiny icons, pure text with no UI elements, photos of people's faces, headshots, portraits, speaker/author photos, team photos, generic blog header images, or hero banners.`,
             },
           ],
         }],
       }),
-    }, { keyName: "ANTHROPIC_API_KEY", service: "anthropic", edgeFunction: "screenshot-worker" });
+    }, { keyName: "LOVABLE_API_KEY", service: "lovable", edgeFunction: "screenshot-worker" });
 
     if (!res.ok) return imageBytes.length > 30000;
     const data = await res.json();
-    const raw = (data.content?.[0]?.text || "").trim().toUpperCase();
+    const raw = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
     const keep = raw.startsWith("KEEP");
     console.log(`[semantic-gate] ${keep ? "KEEP" : "SKIP"}: ${imageUrl.slice(0, 80)} — ${raw.slice(0, 60)}`);
     return keep;
@@ -218,8 +218,8 @@ async function classifyScreenshot(
   competitorName: string,
   scrollPosition: number,
 ): Promise<{ keep: boolean; reason: string }> {
-  const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!ANTHROPIC_API_KEY) {
+  const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
+  if (!LOVABLE_API_KEY) {
     return { keep: true, reason: "no_api_key_fallback" };
   }
 
@@ -231,29 +231,22 @@ async function classifyScreenshot(
     let binary = "";
     for (let i = 0; i < imgBytes.length; i++) binary += String.fromCharCode(imgBytes[i]);
     const base64Data = btoa(binary);
+    const dataUrl = `data:image/png;base64,${base64Data}`;
 
-    const res = await monitoredFetch("https://api.anthropic.com/v1/messages", {
+    const res = await monitoredFetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
       method: "POST",
       headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
+        Authorization: `Bearer ${LOVABLE_API_KEY}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 60,
+        model: "openai/gpt-5.5",
+        max_completion_tokens: 500,
         messages: [
           {
             role: "user",
             content: [
-              {
-                type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/png",
-                  data: base64Data,
-                },
-              },
+              { type: "image_url", image_url: { url: dataUrl } },
               {
                 type: "text",
                 text:
@@ -268,15 +261,15 @@ async function classifyScreenshot(
           },
         ],
       }),
-    }, { keyName: "ANTHROPIC_API_KEY", service: "anthropic", edgeFunction: "screenshot-worker" });
+    }, { keyName: "LOVABLE_API_KEY", service: "lovable", edgeFunction: "screenshot-worker" });
 
     if (!res.ok) {
-      console.log(`[vision-gate] Anthropic error ${res.status}`);
+      console.log(`[vision-gate] Gateway error ${res.status}`);
       return { keep: true, reason: `api_error_${res.status}` };
     }
 
     const data = await res.json();
-    const raw = (data.content?.[0]?.text || "").trim();
+    const raw = (data.choices?.[0]?.message?.content || "").trim();
     const keep = raw.toUpperCase().startsWith("KEEP");
     return { keep, reason: raw.slice(0, 80) };
   } catch (err) {
@@ -324,6 +317,10 @@ Deno.serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // --- Auth guard (shared): valid user JWT or service-role key required ---
+  const authError = await requireAuth(req, corsHeaders);
+  if (authError) return authError;
+
   try {
     const { page_url, competitor_name, page_id, image_count, category, sub_category } = await req.json();
 
@@ -350,6 +347,7 @@ Deno.serve(async (req) => {
 
     const approvedUrls: string[] = [];
     let totalCaptured = 0;
+    let sourceMode: "inline_images_first" | "viewport_fallback" | "none" = "none";
 
     // Live Firecrawl call with markdown+html+screenshot for fresh CDN URLs
     const estimatedSteps = image_count
@@ -420,16 +418,15 @@ Deno.serve(async (req) => {
         const currentMeta = (existing?.metadata as Record<string, unknown>) || {};
         await supabase
           .from("competitor_pages")
-          .update({ metadata: { ...currentMeta, video_urls: videoUrls } })
+          .update({ metadata: { ...currentMeta, discovered_videos: videoUrls } })
           .eq("id", page_id);
       }
     }
 
-    // Phase A: Try to download inline images from markdown
+    // Phase A: Inline images first (preferred)
     const inlineImageUrls = extractInlineImageUrls(combined, page_url).slice(0, MAX_INLINE_IMAGES);
     console.log(`[screenshot-worker] Found ${inlineImageUrls.length} inline images`);
 
-    // Download all images in parallel first
     const downloadResults: Array<{ index: number; imageUrl: string; bytes: Uint8Array; contentType: string } | null> = await Promise.all(
       inlineImageUrls.map(async (imageUrl, i) => {
         try {
@@ -452,7 +449,6 @@ Deno.serve(async (req) => {
 
     const validDownloads = downloadResults.filter((d): d is NonNullable<typeof d> => d !== null);
 
-    // Classify all downloaded images in parallel
     const classifyResults = await Promise.all(
       validDownloads.map(async (dl) => {
         console.log(`[screenshot-worker] Inline ${dl.index + 1}: ${dl.bytes.length} bytes, classifying...`);
@@ -464,7 +460,6 @@ Deno.serve(async (req) => {
       })
     );
 
-    // Upload approved images sequentially (to maintain order)
     for (const result of classifyResults) {
       if (!result.isRelevant) continue;
       const extension = result.contentType.includes("jpeg") ? "jpg" : result.contentType.includes("webp") ? "webp" : "png";
@@ -479,6 +474,7 @@ Deno.serve(async (req) => {
       const publicUrl = pubUrl?.publicUrl || "";
       if (publicUrl) {
         approvedUrls.push(publicUrl);
+        sourceMode = "inline_images_first";
         console.log(`[screenshot-worker] Saved inline ${result.index + 1}`);
       }
     }
@@ -486,6 +482,7 @@ Deno.serve(async (req) => {
     // Phase B: If no inline images saved, use viewport screenshots from the SAME scrape (no second API call)
     if (approvedUrls.length === 0 && viewportScreenshots.length > 0) {
       console.log(`[screenshot-worker] Inline failed, using ${viewportScreenshots.length} viewport screenshots`);
+      sourceMode = "viewport_fallback";
 
       const seenHashes = new Set<string>();
 
@@ -551,10 +548,7 @@ Deno.serve(async (req) => {
 
     await saveScreenshotsToPage(supabase, competitor_name, page_url, page_id, approvedUrls);
 
-    // Store approved media with context in raw_content for agent auto-population
-    // This replaces ephemeral CDN URLs with permanent storage URLs + context metadata
     if (approvedUrls.length > 0) {
-      // Resolve product area: use passed params, or look up from competitors table
       let resolvedCategory = category || "";
       let resolvedSubCategory = sub_category || "";
       if (!resolvedCategory || !resolvedSubCategory) {
@@ -570,7 +564,6 @@ Deno.serve(async (req) => {
       }
 
       const mediaEntries = approvedUrls.map((url, i) => {
-        // Determine source: inline image or viewport screenshot
         const isInline = url.includes("/inline-");
         const sourceImageUrl = isInline && classifyResults[i]
           ? (classifyResults as Array<{ imageUrl?: string }>)[i]?.imageUrl || page_url
@@ -587,20 +580,17 @@ Deno.serve(async (req) => {
         };
       });
 
-      // Build media-enriched content block (permanent, survives CDN expiry cleanup)
       const mediaBlock = [
         "\n\n<!-- APPROVED_MEDIA_START -->",
         JSON.stringify({ competitor: competitor_name, product_area: resolvedCategory, product_sub_area: resolvedSubCategory, approved_media: mediaEntries, updated_at: new Date().toISOString() }),
         "<!-- APPROVED_MEDIA_END -->",
       ].join("\n");
 
-      // Update raw_content: strip old approved media block, append new one
       const updateQuery = page_id
         ? supabase.from("competitor_pages").select("raw_content").eq("id", page_id).maybeSingle()
         : supabase.from("competitor_pages").select("raw_content").eq("competitor_name", competitor_name).eq("page_url", page_url).maybeSingle();
       const { data: currentPage } = await updateQuery;
       let existingContent = currentPage?.raw_content || "";
-      // Strip previous approved media block
       existingContent = existingContent.replace(/\n?\n?<!-- APPROVED_MEDIA_START -->[\s\S]*?<!-- APPROVED_MEDIA_END -->/g, "");
       const newRawContent = existingContent + mediaBlock;
 
@@ -613,13 +603,22 @@ Deno.serve(async (req) => {
       console.log(`[screenshot-worker] Stored ${mediaEntries.length} approved media entries with context in raw_content`);
     }
 
+    // Explicit contract: each approved asset is tagged with its capture_type so
+    // downstream consumers (runTargetedLiveCrawl, persistNewMediaToGallery) do
+    // NOT have to substring-sniff filenames to guess inline-vs-fallback.
+    const approvedAssets = approvedUrls.map((url) => ({
+      url,
+      capture_type: sourceMode === "inline_images_first" ? "inline" : "fallback" as "inline" | "fallback",
+    }));
+
     return new Response(
       JSON.stringify({
         success: true,
-        screenshot_urls: approvedUrls,
+        screenshot_urls: approvedUrls, // backwards compat
+        approved_assets: approvedAssets,
         total_captured: totalCaptured,
         total_approved: approvedUrls.length,
-        source_mode: approvedUrls.length > 0 ? "inline_images_first" : "viewport_fallback",
+        source_mode: sourceMode,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );

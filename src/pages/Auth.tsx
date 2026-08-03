@@ -8,7 +8,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
 import { Loader2, ArrowLeft } from "lucide-react";
-import workdayLogo from "@/assets/workday-logo.png";
+import workdayLogo from "@/assets/workday-logo-full.svg";
 import { supabase } from "@/integrations/supabase/client";
 import { motion, AnimatePresence } from "framer-motion";
 import { fadeInUp, scaleIn } from "@/lib/animations";
@@ -122,7 +122,7 @@ const Auth = () => {
         animate="animate"
         variants={{ animate: { transition: { staggerChildren: 0.12 } } }}
       >
-        <motion.div variants={fadeInUp} className="text-center space-y-3">
+        <motion.div variants={fadeInUp} className="text-center space-y-4 relative">
           <motion.div
             className="flex justify-center"
             initial={{ opacity: 0, scale: 0.8, rotate: -10 }}
@@ -132,10 +132,17 @@ const Auth = () => {
             <img
               src={workdayLogo}
               alt="Workday"
-              className="h-28 w-28 rounded-full object-cover ring-2 ring-primary/30 shadow-lg shadow-primary/10"
+              className="h-12 w-auto"
             />
           </motion.div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">Comp Intelligence Agent</h1>
+          <div className="space-y-2">
+            <h1 className="text-signal text-5xl sm:text-6xl font-bold tracking-[0.18em] uppercase leading-[1.05] whitespace-nowrap">
+              Sentinel
+            </h1>
+            <p className="text-[11px] uppercase tracking-[0.28em] text-muted-foreground">
+              Competitive Intelligence, On Watch.
+            </p>
+          </div>
         </motion.div>
 
         <motion.div variants={fadeInUp} className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">

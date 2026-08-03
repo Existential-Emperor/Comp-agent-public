@@ -1,0 +1,1 @@
+UPDATE public.media_assets SET is_active = true WHERE competitor_name = 'Anaplan' AND is_active = false AND (metadata->>'rescored_at')::timestamptz > now() - interval '30 minutes';

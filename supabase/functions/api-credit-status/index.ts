@@ -1,5 +1,4 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -12,6 +11,10 @@ const KEY_ENV_NAMES = [
   "FIRECRAWL_API_KEY_2",
   "FIRECRAWL_API_KEY_3",
   "FIRECRAWL_API_KEY_4",
+];
+
+const ANTHROPIC_KEY_NAMES = [
+  "ANTHROPIC_API_KEY",
 ];
 
 interface CreditInfo {
@@ -172,186 +175,6 @@ async function checkAnthropicKey(apiKey: string): Promise<{ status: string; mess
   }
 }
 
-const TAVILY_USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
-const TAVILY_SNAPSHOT_EVENT_TYPE = "usage_snapshot";
-
-let tavilyUsageCache:
-  | { credits: CreditInfo; status: "healthy" | "exhausted" | "unknown"; message: string; fetchedAt: number }
-  | null = null;
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function statusFromCredits(credits: CreditInfo): "healthy" | "exhausted" | "unknown" {
-  if (credits.remainingCredits == null) return "unknown";
-  return credits.remainingCredits <= 0 ? "exhausted" : "healthy";
-}
-
-function parseTavilyUsage(data: any): { status: "healthy" | "exhausted"; message: string; credits: CreditInfo } {
-  // Tavily returns: { key: { usage, limit, ... }, account: { plan_usage, plan_limit, current_plan, ... } }
-  const keyUsage = data?.key?.usage ?? null;
-  const keyLimit = data?.key?.limit ?? null;
-  const acctUsage = data?.account?.plan_usage ?? null;
-  const acctLimit = data?.account?.plan_limit ?? null;
-  const planName = data?.account?.current_plan ?? null;
-  const resetDate = data?.account?.current_period_end ?? null;
-
-  const used = acctUsage ?? keyUsage ?? null;
-  const total = acctLimit ?? keyLimit ?? null;
-  const remaining = total != null && used != null ? Math.max(0, total - used) : null;
-  const isExhausted = remaining != null && remaining <= 0;
-
-  return {
-    status: isExhausted ? "exhausted" : "healthy",
-    message: isExhausted ? "Credits exhausted" : "Key is active",
-    credits: {
-      totalCredits: total,
-      usedCredits: used,
-      remainingCredits: remaining,
-      planName,
-      resetDate,
-    },
-  };
-}
-
-async function getLatestTavilySnapshot(supabase: any): Promise<CreditInfo | null> {
-  const { data } = await supabase
-    .from("api_key_events")
-    .select("metadata")
-    .eq("service", "tavily")
-    .eq("key_name", "TAVILY_API_KEY")
-    .eq("event_type", TAVILY_SNAPSHOT_EVENT_TYPE)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const metadata = data?.metadata as Record<string, unknown> | null | undefined;
-  if (!metadata) return null;
-
-  return {
-    totalCredits: typeof metadata.totalCredits === "number" ? metadata.totalCredits : null,
-    usedCredits: typeof metadata.usedCredits === "number" ? metadata.usedCredits : null,
-    remainingCredits: typeof metadata.remainingCredits === "number" ? metadata.remainingCredits : null,
-    planName: typeof metadata.planName === "string" ? metadata.planName : null,
-    resetDate: typeof metadata.resetDate === "string" ? metadata.resetDate : null,
-  };
-}
-
-async function storeTavilySnapshot(supabase: any, credits: CreditInfo): Promise<void> {
-  await supabase.from("api_key_events").insert({
-    key_name: "TAVILY_API_KEY",
-    service: "tavily",
-    event_type: TAVILY_SNAPSHOT_EVENT_TYPE,
-    edge_function: "api-credit-status",
-    notified: true,
-    metadata: {
-      totalCredits: credits.totalCredits,
-      usedCredits: credits.usedCredits,
-      remainingCredits: credits.remainingCredits,
-      planName: credits.planName,
-      resetDate: credits.resetDate,
-    },
-  });
-}
-
-async function checkTavilyKey(apiKey: string, supabase: any): Promise<{ status: string; message: string; credits: CreditInfo }> {
-  const emptyCredits: CreditInfo = { totalCredits: null, usedCredits: null, remainingCredits: null };
-
-  if (!tavilyUsageCache) {
-    const snapshot = await getLatestTavilySnapshot(supabase);
-    if (snapshot) {
-      tavilyUsageCache = {
-        credits: snapshot,
-        status: statusFromCredits(snapshot),
-        message: "Showing last synced usage",
-        fetchedAt: Date.now(),
-      };
-    }
-  }
-
-  // Serve cached usage first to avoid Tavily rate limits on repeated dashboard refreshes
-  if (tavilyUsageCache && Date.now() - tavilyUsageCache.fetchedAt < TAVILY_USAGE_CACHE_TTL_MS) {
-    return {
-      status: tavilyUsageCache.status,
-      message: tavilyUsageCache.message,
-      credits: tavilyUsageCache.credits,
-    };
-  }
-
-  try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const res = await fetch("https://api.tavily.com/usage", {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-      });
-
-      if (res.status === 401 || res.status === 403) {
-        await res.text();
-        return { status: "error", message: `Auth error (${res.status})`, credits: emptyCredits };
-      }
-
-      if (res.status === 429) {
-        await res.text();
-
-        // Retry once with backoff
-        if (attempt === 0) {
-          const retryAfterHeader = res.headers.get("retry-after");
-          const retryAfterMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : 1200;
-          await sleep(Number.isFinite(retryAfterMs) ? Math.min(retryAfterMs, 3000) : 1200);
-          continue;
-        }
-
-        // Fallback to latest cached/snapshotted usage
-        if (tavilyUsageCache) {
-          return {
-            status: tavilyUsageCache.status,
-            message: "Rate limited (429) — showing last synced usage",
-            credits: tavilyUsageCache.credits,
-          };
-        }
-
-        return { status: "unknown", message: "Rate limited (429) — retry in a minute", credits: emptyCredits };
-      }
-
-      if (!res.ok) {
-        await res.text();
-        return { status: "unknown", message: `Status ${res.status}`, credits: emptyCredits };
-      }
-
-      const data = await res.json();
-      const parsed = parseTavilyUsage(data);
-
-      tavilyUsageCache = {
-        status: parsed.status,
-        message: parsed.message,
-        credits: parsed.credits,
-        fetchedAt: Date.now(),
-      };
-
-      // Persist for cold starts so the dashboard still shows limit/usage during temporary rate limits
-      await storeTavilySnapshot(supabase, parsed.credits);
-
-      return parsed;
-    }
-
-    return { status: "unknown", message: "Unknown Tavily response", credits: emptyCredits };
-  } catch (err) {
-    // Fallback to cached snapshot on transient network errors
-    if (tavilyUsageCache) {
-      return {
-        status: tavilyUsageCache.status,
-        message: "Network error — showing last synced usage",
-        credits: tavilyUsageCache.credits,
-      };
-    }
-
-    return { status: "error", message: `Network error: ${err instanceof Error ? err.message : "unknown"}`, credits: emptyCredits };
-  }
-}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -430,24 +253,7 @@ Deno.serve(async (req) => {
     };
   })();
 
-  const tavilyCheck = (async () => {
-    const val = Deno.env.get("TAVILY_API_KEY");
-    if (!val || !val.trim()) {
-      return { envName: "TAVILY_API_KEY", service: "tavily", configured: false, hint: null, liveStatus: "unconfigured" as const, credits: emptyCredits };
-    }
-    const result = await checkTavilyKey(val.trim(), supabase);
-    return {
-      envName: "TAVILY_API_KEY",
-      service: "tavily",
-      configured: true,
-      hint: `...${val.trim().slice(-4)}`,
-      liveStatus: result.status as KeyLiveStatus["liveStatus"],
-      liveMessage: result.message,
-      credits: result.credits,
-    };
-  })();
-
-  const allChecks = await Promise.all([...firecrawlChecks, anthropicCheck, tavilyCheck]);
+  const allChecks = await Promise.all([...firecrawlChecks, anthropicCheck]);
 
   // --- 2. Event history ---
   const trackedEventTypes = ["credits_exhausted", "rate_limited", "auth_error", "unknown_error"];

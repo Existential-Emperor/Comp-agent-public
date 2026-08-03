@@ -1,3 +1,5 @@
+import { supabase } from "@/integrations/supabase/client";
+
 export interface CategoryData {
   name: string;
   subCategories: {
@@ -230,8 +232,101 @@ export const getSubCategories = (categoryName: string) => {
   return cat?.subCategories.map((sc) => sc.name) ?? [];
 };
 
+// ===== Sheet-ingested profiles (XLSX knowledge base) =====
+// Cached merged competitor lookups: (category|sub_category) → competitor list
+
+type Competitor = { name: string; website: string; description: string };
+type ProfileRow = {
+  id: string;
+  name: string;
+  website: string | null;
+  product_focus: string | null;
+};
+type MappingRow = { competitor_id: string; category: string; sub_category: string };
+
+let _profilesById: Map<string, ProfileRow> | null = null;
+let _mappingsByKey: Map<string, ProfileRow[]> | null = null;
+let _allProfiles: ProfileRow[] = [];
+let _loadPromise: Promise<void> | null = null;
+
+const keyFor = (cat: string, sub: string) => `${cat}::${sub}`;
+
+async function loadProfiles(): Promise<void> {
+  if (_profilesById) return;
+  if (_loadPromise) return _loadPromise;
+  _loadPromise = (async () => {
+    try {
+      const [{ data: profiles }, { data: mappings }] = await Promise.all([
+        supabase.from("competitor_profiles").select("id,name,website,product_focus"),
+        supabase.from("competitor_product_area_mappings").select("competitor_id,category,sub_category"),
+      ]);
+      const byId = new Map<string, ProfileRow>();
+      for (const p of (profiles as ProfileRow[] | null) ?? []) byId.set(p.id, p);
+      const byKey = new Map<string, ProfileRow[]>();
+      for (const m of (mappings as MappingRow[] | null) ?? []) {
+        const profile = byId.get(m.competitor_id);
+        if (!profile) continue;
+        const k = keyFor(m.category, m.sub_category);
+        const arr = byKey.get(k) ?? [];
+        arr.push(profile);
+        byKey.set(k, arr);
+      }
+      _profilesById = byId;
+      _mappingsByKey = byKey;
+      _allProfiles = [...byId.values()];
+    } catch (e) {
+      console.error("loadProfiles failed:", e);
+      _profilesById = new Map();
+      _mappingsByKey = new Map();
+      _allProfiles = [];
+    }
+  })();
+  return _loadPromise;
+}
+
+// Eagerly kick off the load on module init so dropdowns are populated quickly
+void loadProfiles();
+
+function profileToCompetitor(p: ProfileRow): Competitor {
+  return {
+    name: p.name,
+    website: p.website ?? "",
+    description: p.product_focus ?? "Sheet-ingested competitor",
+  };
+}
+
+function mergeDedup(seed: Competitor[], extras: Competitor[]): Competitor[] {
+  const out: Competitor[] = [...seed];
+  const seen = new Set(seed.map((c) => c.name.toLowerCase().trim()));
+  for (const c of extras) {
+    const k = c.name.toLowerCase().trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * Synchronous, returns whatever's already loaded. The load is kicked off at
+ * module init and refreshed in the background; callers see seed-only on first
+ * paint (rare) and the merged set after the cache warms.
+ */
 export const getSeedCompetitors = (categoryName: string, subCategoryName: string) => {
   const cat = categories.find((c) => c.name === categoryName);
   const sub = cat?.subCategories.find((sc) => sc.name === subCategoryName);
-  return sub?.competitors ?? [];
+  const seed = sub?.competitors ?? [];
+  if (!_mappingsByKey) {
+    void loadProfiles();
+    return seed;
+  }
+  // Full Product → Full Product gets ALL ingested profiles
+  if (categoryName === "Full Product" && subCategoryName === "Full Product") {
+    return mergeDedup(seed, _allProfiles.map(profileToCompetitor));
+  }
+  const extras = (_mappingsByKey.get(keyFor(categoryName, subCategoryName)) ?? []).map(profileToCompetitor);
+  return mergeDedup(seed, extras);
 };
+
+/** Awaits the initial DB load. Useful for tests or eager UI. */
+export const ensureSeedDataLoaded = () => loadProfiles();

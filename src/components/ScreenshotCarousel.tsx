@@ -3,6 +3,7 @@ import useEmblaCarousel from "embla-carousel-react";
 import { ChevronLeft, ChevronRight, Maximize2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import MediaLightbox, { useLightbox, getHighResImageUrl, type MediaItem } from "@/components/MediaLightbox";
+import SmartImage from "@/components/SmartImage";
 
 interface ScreenshotCarouselProps {
   images: { alt: string; url: string }[];
@@ -27,8 +28,8 @@ const ScreenshotCarousel: React.FC<ScreenshotCarouselProps> = ({ images }) => {
 
   return (
     <div className="mb-4">
-      <div className="flex items-center gap-2 mb-2">
-        <span className="text-xs font-semibold text-foreground">Visual Overview</span>
+      <div className="flex items-baseline gap-2 mb-3 mt-6">
+        <h2 className="text-xl font-semibold text-foreground">Visual Overview</h2>
         <span className="text-xs text-muted-foreground">({images.length} screenshot{images.length !== 1 ? "s" : ""})</span>
       </div>
       <div className="relative group">
@@ -42,12 +43,12 @@ const ScreenshotCarousel: React.FC<ScreenshotCarouselProps> = ({ images }) => {
                     onClick={() => lightbox.openImage(getHighResImageUrl(img.url), img.alt, undefined, allItems, i)}
                     className="w-full cursor-pointer relative"
                   >
-                    <img
+                    <SmartImage
                       src={img.url}
                       alt={img.alt}
                       className="w-full h-48 object-contain bg-muted/30"
-                      loading="lazy"
-                      onError={(e) => { e.currentTarget.style.display = "none"; }}
+                      height={192}
+                      eager={i < 2}
                     />
                     <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                       <div className="bg-black/60 rounded p-1">

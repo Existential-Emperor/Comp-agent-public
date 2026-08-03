@@ -14,7 +14,7 @@
  *   });
  */
 
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 
 interface KeyEventInput {
   keyName: string;
@@ -101,12 +101,12 @@ export async function logKeyEvent(input: KeyEventInput): Promise<void> {
 
     console.log(`[api-key-monitor] ⚠️ Logged ${eventType} for ${keyName} (${service}) from ${edgeFunction || "unknown"}`);
 
-    // Fire-and-forget: trigger email notification
-    const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("SUPABASE_PUBLISHABLE_KEY") || "";
+    // Fire-and-forget: trigger email notification (service-role auth for the guarded endpoint)
+    const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
     fetch(`${SUPABASE_URL}/functions/v1/notify-key-exhaustion`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({

@@ -1,59 +1,52 @@
+## Goal
 
+77,683 customers are stuck in `pending` because the matcher ran as one long self-chaining loop: a CPU-kill terminated the isolate before it could re-invoke itself, so the chain died permanently. Fix the architecture, not the symptom — make each invocation a bounded, independent worker driven by an external cron tick, so any process that dies is simply replaced by the next tick continuing the remaining work.
 
-## Prioritize Crunchbase and Gartner as Core Data Sources
+## #1 — Loop → durable queue (the architectural fix)
 
-### What Changes
+Each invocation becomes a **single bounded chunk worker**, not a loop:
 
-Both the **discover-competitors** and **chat-analysis** backend functions will be updated to run a two-phase search strategy:
+- Remove the `while (Date.now() - startedAt < TIME_BUDGET_MS)` drain loop. One invocation claims **one chunk** of pending rows (e.g. 2,000), matches them, writes results, and returns.
+- A `pg_cron` job ticks **every minute**, calling `Customer_exists` via `net.http_post` with the existing `x-cron-secret` header (same pattern as `fetch-news`/`ambient-crawler`). Each tick is an independent process.
+- Resumability is automatic: matching only reads `match_status='pending'` and flips rows out of that pool. If a tick CPU-exhausts mid-chunk, the rows already written are done; the rest stay `pending` and the next tick picks them up. No state to repair.
+- Per-tick throughput fix (root cause of the CPU exhaustion): replace the 1,000 per-row `UPDATE` round-trips with **one set-based write per chunk** via a new `SECURITY DEFINER` RPC `apply_customer_matches(_rows jsonb)` doing `UPDATE customers ... FROM jsonb_to_recordset(...)`. This is threading existing data through one existing code path, not new infrastructure — and it makes each bounded tick actually finish inside budget.
 
-1. **Phase 1 (Priority):** Search Crunchbase and Gartner specifically using Tavily's `include_domains` filter
-2. **Phase 2 (Broad):** Search the open web for additional results (existing behavior)
+## #2 — Delete the self-invoke continuation
 
-Results from both phases are merged, with Crunchbase/Gartner results placed first so the AI model treats them as higher-priority data.
+With the cron tick as the continuation, the self-chaining apparatus is removed entirely:
 
-### Changes by File
+- Delete `selfInvoke`, `hop`, `MAX_HOPS`, and the chained `refresh_index → match` handoff.
+- Index refresh folds into the same cadence: each tick first advances **one** stale root (via `staleRoots()`) if any exists, otherwise matches one chunk. All 6 roots are currently populated, so this is normally a no-op — but it keeps a single durable driver for both phases with no self-invocation.
+- **Concurrency guard** (the only surviving piece of #2's territory): wrap the worker body in a Postgres advisory lock via a `try_match_lock()` RPC (`pg_try_advisory_lock`). An overlapping tick that can't get the lock returns immediately, preventing two ticks from re-pulling the same pending rows or stampeding CPU.
 
-#### 1. `supabase/functions/discover-competitors/index.ts`
+## UI (`src/pages/Customers.tsx`)
 
-- Add a **priority search phase** with 2 queries targeting `include_domains: ["crunchbase.com", "gartner.com"]`
-  - e.g. `"competitors of Workday Adaptive Planning {subCategory} site:crunchbase.com OR site:gartner.com"`
-- Keep the existing 3 broad queries as Phase 2 (unchanged)
-- Merge results: priority results first, then broad results
-- The AI extraction prompt will note that Crunchbase/Gartner sources should be weighted higher
+- `runMatching` keeps the "Run matching" button as a manual **kick** — one immediate worker tick (`action: "match"`) — then shows `processed` / `remaining`, with the existing "continuing in background" messaging now backed by the real cron driver.
+- The `reset` path (re-match everything) stays: it flips all rows back to `pending`; the cron drains them.
 
-#### 2. `supabase/functions/chat-analysis/index.ts` (gatherIntelligence function)
+## Technical details
 
-- Add a **priority search pass** with queries filtered to `include_domains: ["crunchbase.com", "gartner.com"]`
-  - e.g. `"{competitor} {subCategory} profile"` scoped to Crunchbase/Gartner
-- Run existing broad queries as Phase 2 (unchanged)
-- Prepend priority results to the intelligence array so the summarizer sees them first
+Files / objects touched:
 
-### What Stays the Same
-
-- All existing broad web searches remain untouched
-- No UI changes
-- No database changes
-- No new secrets needed (uses existing Tavily key)
-- The Tavily search endpoint and all other logic remain identical
-
-### Technical Details
-
-**Priority domains list:**
-```
-["crunchbase.com", "gartner.com"]
+```text
+supabase/functions/Customer_exists/index.ts   rewrite handler: bounded single-chunk worker,
+                                              remove selfInvoke/hop/MAX_HOPS/while-loop,
+                                              call apply_customer_matches + try_match_lock
+migration                                     create apply_customer_matches(jsonb) RPC
+                                              create try_match_lock()/unlock RPC (advisory lock)
+cron (via insert tool, not migration)         schedule Customer_exists every minute with
+                                              x-cron-secret (contains anon key — insert, not migrate)
+src/pages/Customers.tsx                        runMatching → single-tick kick + progress toast
 ```
 
-**Example priority queries (discover-competitors):**
-```
-"{subCategory} software companies competing with Adaptive Planning site:crunchbase.com"
-"{subCategory} enterprise software vendors Gartner Magic Quadrant"
-```
+Notes:
+- Cron scheduling uses the `insert` tool (not a migration) because the command embeds the project anon key, matching the existing job rows.
+- RPCs are `SECURITY DEFINER` with `search_path = public`, granted to `service_role` (and the worker calls them with the service client). No anon exposure.
+- No adaptive-planning or customer data leaves the system; only the 6 public competitor roots are ever sent externally (unchanged).
+- Chunk size and cron interval are tunable; starting point 2,000 rows/tick @ 1 min drains ~78k in well under two hours, self-healing across any CPU kills.
 
-**Example priority queries (chat-analysis):**
-```
-"{competitor} company profile funding {subCategory}"  (scoped to crunchbase.com, gartner.com)
-"{competitor} Gartner review {subCategory} software"  (scoped to crunchbase.com, gartner.com)
-```
+## Verification
 
-Results from priority searches are placed before broad results in the array, ensuring the AI model gives them higher weight during extraction and summarization.
-
+- After deploy + schedule: watch `match_status` counts fall (`pending` → `matched`/`unmatched`) across successive minutes via read queries.
+- Confirm a CPU-killed tick no longer stalls the pipeline (counts keep moving on the next tick).
+- Confirm overlapping ticks no-op cleanly (advisory lock) in edge logs.

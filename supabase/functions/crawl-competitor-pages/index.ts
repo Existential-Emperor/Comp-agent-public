@@ -1,6 +1,6 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { firecrawlFetch, hasFirecrawlKey, getActiveFirecrawlKey } from "../_shared/firecrawl-keys.ts";
+import { requireAuth } from "../_shared/auth.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -195,7 +195,7 @@ async function summarizeContent(content: string, competitor: string, pageType: s
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash-lite",
+        model: "openai/gpt-5.5",
         messages: [
           {
             role: "system",
@@ -203,8 +203,7 @@ async function summarizeContent(content: string, competitor: string, pageType: s
           },
           { role: "user", content: content.slice(0, 30000) },
         ],
-        max_tokens: 2000,
-        temperature: 0.1,
+        max_completion_tokens: 2000,
       }),
     });
     if (!res.ok) return content.slice(0, 2000);
@@ -419,9 +418,8 @@ async function shouldScreenshotPageSemantically(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash-lite",
-        temperature: 0,
-        max_tokens: 40,
+        model: "openai/gpt-5.5",
+        max_completion_tokens: 500,
         messages: [
           {
             role: "system",
@@ -478,13 +476,9 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader?.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    // Real auth: valid user JWT or service-role key (presence-only check was bypassable)
+    const authError = await requireAuth(req, corsHeaders);
+    if (authError) return authError;
 
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
     const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -502,7 +496,7 @@ Deno.serve(async (req) => {
     // mode=trigger_all: fan out individual competitor calls
     if (body.mode === "full" || body.mode === "trigger_all") {
       const keys = Object.keys(COMPETITOR_SOURCES);
-      const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("SUPABASE_PUBLISHABLE_KEY") || "";
+      const SUPABASE_ANON_KEY = SUPABASE_SERVICE_ROLE_KEY;
 
       for (const key of keys) {
         fetch(`${SUPABASE_URL}/functions/v1/crawl-competitor-pages`, {
@@ -688,7 +682,7 @@ Deno.serve(async (req) => {
       screenshotCandidates.map(c => `${c.url} (score: ${c.screenshotScore}, saved: ${c.savedImageUrls.length})`));
 
     // Phase 3: Store intelligence for all pages; fire off screenshot-worker for approved pages
-    const SUPABASE_ANON_KEY2 = Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("SUPABASE_PUBLISHABLE_KEY") || "";
+    const SUPABASE_ANON_KEY2 = SUPABASE_SERVICE_ROLE_KEY;
 
     for (const candidate of allCandidates) {
       try {

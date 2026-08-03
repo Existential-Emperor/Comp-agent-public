@@ -1,1754 +1,46 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { getProductAreaDescription } from "../_shared/product-areas.ts";
 import { retrieveKnowledge } from "../_shared/knowledge-retrieval.ts";
+import { retrieveDocKnowledge, retrieveRoadmapKnowledge } from "../_shared/kb-doc-retrieval.ts";
 import { firecrawlFetch, hasFirecrawlKey } from "../_shared/firecrawl-keys.ts";
 import { monitoredFetch } from "../_shared/monitored-fetch.ts";
+import { buildSlideSummaryPayload, SLIDE_SUMMARY_MODEL, type SlideSummaryPayload } from "../_shared/slide-summary.ts";
+import {
+  isGalleryOnlyCompetitor,
+  mediaDedupeKey,
+  type GalleryMediaResult,
+} from "../_shared/media-helpers.ts";
+import {
+  startMediaGather, gatherOnDemandMedia,
+  type MediaGatherHandle, type MediaFullResult, type MediaItemPayload, type LiveCrawlMetadata,
+} from "../_shared/media-pipeline.ts";
+import {
+  getCachedIntelligence, gatherLiveIntelligenceAndMedia, claudeWebSearch,
+  classifyIntent, extractUrls, scrapeUserUrls, discoverAndScrapeSubpages,
+} from "../_shared/intelligence-helpers.ts";
+import { evaluateResponse, type JudgeEvaluation } from "../_shared/judge-helpers.ts";
+import { runResponseContract, judgeResponse } from "../_shared/response-contract.ts";
+import { classifyQueryIntent } from "../_shared/query-intent.ts";
+import { getProfilesByNames, formatProfilesForPrompt, getPriorityUrls, findProfilesInText } from "../_shared/competitor-profiles.ts";
+import { fetchFeedEvidenceForCompetitors, type FeedEvidence } from "../_shared/feed-context.ts";
+import { EvidenceSourceRegistry } from "../_shared/evidence-source-registry.ts";
+import { finalizeResponse } from "../_shared/finalize-response.ts";
+import { safeStage } from "../_shared/safe-stage.ts";
+import type { PipelineDiagnostics, StageDiagnostics } from "../_shared/pipeline-types.ts";
+// redeploy-marker: 2026-05-01T15:30Z V1-deleted
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-type SlideSectionSummary = {
-  heading: string;
-  bullets: string[];
-  summaries: string[];
-};
-
-type SlideSummaryPayload = {
-  sections: SlideSectionSummary[];
-  lookup: Record<string, string>;
-  generated_at: string;
-  model: string;
-  version: number;
-};
-
-function normalizeSlideText(value: string): string {
-  return value
-    .replace(/\*\*/g, "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function buildSlideLookupKey(heading: string, bullet: string): string {
-  const normalizedHeading = normalizeSlideText(heading) || "__global__";
-  const normalizedBullet = normalizeSlideText(bullet);
-  return `${normalizedHeading}::${normalizedBullet}`;
-}
-
-function cleanSlideBullet(text: string): string {
-  return text
-    .replace(/\*\*/g, "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/https?:\/\/\S+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function parseContentSectionsForSlides(content: string): { heading: string; bullets: string[] }[] {
-  const lines = content.split("\n");
-  const sections: { heading: string; bullets: string[] }[] = [];
-  let currentHeading = "Key Findings";
-  let currentBullets: string[] = [];
-
-  const flush = () => {
-    if (currentBullets.length === 0) return;
-    sections.push({ heading: currentHeading, bullets: currentBullets });
-    currentBullets = [];
-  };
-
-  for (const rawLine of lines) {
-    const headingMatch = rawLine.match(/^#{1,3}\s+(.+)/);
-    if (headingMatch) {
-      flush();
-      currentHeading = headingMatch[1].replace(/\*\*/g, "").trim() || "Key Findings";
-      continue;
-    }
-
-    const bulletMatch = rawLine.match(/^\s*[-*•]\s+(.+)/);
-    if (bulletMatch) {
-      const cleaned = cleanSlideBullet(bulletMatch[1]);
-      if (cleaned.length > 8) currentBullets.push(cleaned);
-    }
-  }
-
-  flush();
-  return sections;
-}
-
-async function summarizeSlideChunk(
-  LOVABLE_API_KEY: string,
-  chunk: Array<{ heading: string; bullet: string }>,
-  context?: string,
-): Promise<string[]> {
-  if (chunk.length === 0) return [];
-
-  const numberedBullets = chunk
-    .map((item, i) => `[${i + 1}] Section: ${item.heading}\nBullet: ${item.bullet}`)
-    .join("\n\n");
-
-  const systemPrompt = `You rewrite detailed analysis bullets into concise slide bullets.
-
-Rules:
-- Preserve the FULL meaning and key recommendation/finding
-- Use 1-2 sentences max
-- Max 280 characters per summary
-- No markdown, citations, or links
-- Keep original order
-- Return ONLY a JSON array of strings
-- Array length must be exactly ${chunk.length}`;
-
-  const userPrompt = `${context ? `Context: ${context}\n\n` : ""}Summarize each bullet:\n\n${numberedBullets}`;
-
-  try {
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "openai/gpt-5-nano",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        max_completion_tokens: 4096,
-      }),
-    });
-
-    if (!response.ok) {
-      return chunk.map((item) => cleanSlideBullet(item.bullet));
-    }
-
-    const data = await response.json();
-    const rawContent = data.choices?.[0]?.message?.content || "[]";
-    const jsonMatch = rawContent.match(/\[[\s\S]*\]/);
-
-    let parsed: string[] = [];
-    try {
-      parsed = JSON.parse(jsonMatch?.[0] || "[]");
-    } catch {
-      parsed = rawContent
-        .split("\n")
-        .map((line: string) => line.replace(/^\d+[.)]\s*/, "").replace(/^[-*•]\s*/, "").trim())
-        .filter((line: string) => line.length > 4);
-    }
-
-    while (parsed.length < chunk.length) {
-      parsed.push(cleanSlideBullet(chunk[parsed.length].bullet));
-    }
-
-    return parsed.slice(0, chunk.length).map((value) => cleanSlideBullet(value));
-  } catch {
-    return chunk.map((item) => cleanSlideBullet(item.bullet));
-  }
-}
-
-async function buildSlideSummaryPayload(
-  content: string,
-  context: string,
-  LOVABLE_API_KEY: string,
-): Promise<SlideSummaryPayload | null> {
-  const parsedSections = parseContentSectionsForSlides(content);
-  if (parsedSections.length === 0) return null;
-
-  const flatItems: Array<{ heading: string; bullet: string; sectionIdx: number; bulletIdx: number }> = [];
-  parsedSections.forEach((section, sectionIdx) => {
-    section.bullets.forEach((bullet, bulletIdx) => {
-      flatItems.push({ heading: section.heading, bullet, sectionIdx, bulletIdx });
-    });
-  });
-
-  if (flatItems.length === 0) return null;
-
-  const MAX_BULLETS = 120;
-  const limitedItems = flatItems.slice(0, MAX_BULLETS);
-  const chunkSize = 30;
-  const chunks: Array<Array<{ heading: string; bullet: string }>> = [];
-  for (let i = 0; i < limitedItems.length; i += chunkSize) {
-    chunks.push(limitedItems.slice(i, i + chunkSize).map((item) => ({ heading: item.heading, bullet: item.bullet })));
-  }
-
-  const chunkSummaries = await Promise.all(
-    chunks.map((chunk) => summarizeSlideChunk(LOVABLE_API_KEY, chunk, context)),
-  );
-  const summaryList = chunkSummaries.flat();
-
-  const summaryByKey = new Map<string, string>();
-  limitedItems.forEach((item, idx) => {
-    summaryByKey.set(`${item.sectionIdx}:${item.bulletIdx}`, summaryList[idx] || cleanSlideBullet(item.bullet, 300));
-  });
-
-  const sections: SlideSectionSummary[] = parsedSections.map((section, sectionIdx) => {
-    const summaries = section.bullets.map((bullet, bulletIdx) => {
-      return summaryByKey.get(`${sectionIdx}:${bulletIdx}`) || cleanSlideBullet(bullet, 300);
-    });
-    return {
-      heading: section.heading,
-      bullets: section.bullets,
-      summaries,
-    };
-  });
-
-  const lookup: Record<string, string> = {};
-  for (const section of sections) {
-    for (let i = 0; i < section.bullets.length; i++) {
-      const bullet = section.bullets[i];
-      const summary = section.summaries[i] || cleanSlideBullet(bullet, 300);
-      lookup[buildSlideLookupKey(section.heading, bullet)] = summary;
-      lookup[buildSlideLookupKey("", bullet)] = summary;
-    }
-  }
-
-  return {
-    sections,
-    lookup,
-    generated_at: new Date().toISOString(),
-    model: "openai/gpt-5-nano",
-    version: 1,
-  };
-}
-
 function queueBackgroundTask(task: Promise<unknown>) {
   try {
     const edgeRuntime = (globalThis as any)?.EdgeRuntime;
     if (edgeRuntime?.waitUntil && typeof edgeRuntime.waitUntil === "function") {
       edgeRuntime.waitUntil(task);
-      return;
     }
-  } catch {
-    // no-op
-  }
-}
-
-// ===== Semantic relevance using product area definitions =====
-
-function buildSemanticSearchTerms(category: string, subCategory: string): string[] {
-  const desc = getProductAreaDescription(category, subCategory);
-  if (!desc) return [subCategory.toLowerCase()];
-
-  // Extract key noun phrases and technical terms from the product area definition
-  const terms: string[] = [];
-  
-  // Add the product area name itself (variations)
-  terms.push(subCategory.toLowerCase());
-  
-  // Extract quoted/technical terms and key capability phrases from the definition
-  const technicalPatterns = [
-    /\b(?:add-(?:in|on)|plug-?in|integration|connector|extension)\b/gi,
-    /\b(?:Google Sheets|Excel|PowerPoint|Word)\b/gi,
-    /\b(?:dashboard|visualization|report(?:ing)?|forecast(?:ing)?|anomaly|drill[- ](?:through|down))\b/gi,
-    /\b(?:matrix|hypercube|cube sheet|modeled sheet|standard sheet)\b/gi,
-    /\b(?:workflow|approval|audit trail|cell note|process tracker)\b/gi,
-    /\b(?:workforce|headcount|HCM|sales planning|territory|quota|consolidation)\b/gi,
-    /\b(?:machine learning|ML|ARIMA|predictive|AI)\b/gi,
-    /\b(?:ETL|data source|loader|import|data integration)\b/gi,
-    /\b(?:ad[- ]hoc|Cell Explorer|OfficeConnect)\b/gi,
-    /\b(?:intercompany|currency translation|elimination|financial close)\b/gi,
-    /\b(?:natural language|conversational|variance analysis)\b/gi,
-    /\b(?:spreadsheet|write-?back|refresh)\b/gi,
-  ];
-
-  for (const pattern of technicalPatterns) {
-    const matches = desc.matchAll(pattern);
-    for (const m of matches) {
-      const term = m[0].toLowerCase().trim();
-      if (term.length > 2 && !terms.includes(term)) terms.push(term);
-    }
-  }
-
-  return terms;
-}
-
-function isPageSemanticlyRelevant(
-  page: { title?: string; page_url?: string; content_summary?: string },
-  category: string,
-  subCategory: string
-): boolean {
-  const isFullProduct = category === "Full Product" && subCategory === "Full Product";
-  if (isFullProduct) return true;
-
-  const searchTerms = buildSemanticSearchTerms(category, subCategory);
-  if (searchTerms.length === 0) return true;
-
-  const haystack = [
-    page.title || "",
-    page.page_url || "",
-    (page.content_summary || "").slice(0, 1000),
-  ].join(" ").toLowerCase();
-
-  // Require at least one semantic term match
-  return searchTerms.some(term => haystack.includes(term));
-}
-
-function buildSearchQueries(competitor: string, category: string, subCategory: string): string[] {
-  const desc = getProductAreaDescription(category, subCategory);
-  const queries: string[] = [];
-
-  if (desc) {
-    // Extract the core capability concept from the first sentence
-    const firstSentence = desc.split(".")[0];
-    queries.push(`${competitor} ${firstSentence.slice(0, 80)}`);
-  }
-
-  // Build semantic queries from the definition context
-  const searchTerms = buildSemanticSearchTerms(category, subCategory);
-  const topTerms = searchTerms.slice(0, 4).join(" ");
-  queries.push(`${competitor} ${topTerms} features`);
-  queries.push(`${competitor} ${subCategory} product documentation`);
-
-  return queries;
-}
-
-/** Competitors that lack dedicated public product pages — only use YouTube videos, skip image crawling */
-const VIDEO_ONLY_COMPETITORS = new Set(["planful"]);
-
-/** Priority competitors with pre-crawled, permanently-stored media gallery.
- *  For these, we SKIP live crawling entirely and serve media directly from media_assets. */
-const GALLERY_ONLY_COMPETITORS = new Set([
-  "onestream", "anaplan", "planful", "oracle", "oracleepm", "oracleepmcloud",
-  "oraclepbcs", "oraclefccs", "sap", "sapanalyticscloud", "sapbpc", "pigment",
-]);
-
-function isGalleryOnlyCompetitor(competitor: string): boolean {
-  const token = competitor.toLowerCase().replace(/[^a-z0-9]/g, "");
-  return GALLERY_ONLY_COMPETITORS.has(token);
-}
-
-function isVideoOnlyCompetitor(competitor: string): boolean {
-  return VIDEO_ONLY_COMPETITORS.has(competitor.toLowerCase().replace(/[^a-z0-9]/g, ""));
-}
-
-/** Build fuzzy name variants for competitor page lookup.
- *  e.g. "Oracle" → ["Oracle", "Oracle EPM Cloud", "Oracle Fusion Cloud EPM", ...] */
-function getCompetitorNameVariants(competitor: string): string[] {
-  const variants = [competitor];
-  const token = competitor.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-  const KNOWN_EXPANSIONS: Record<string, string[]> = {
-    oracle: ["Oracle EPM Cloud", "Oracle Fusion Cloud EPM", "Oracle Hyperion Planning", "Oracle Essbase"],
-    sap: ["SAP Analytics Cloud", "SAP BPC", "SAP Group Reporting"],
-    ibm: ["IBM Planning Analytics", "IBM Cognos TM1"],
-    workday: ["Workday Adaptive Planning"],
-    onestream: ["OneStream XF", "OneStream Software"],
-    planful: ["Planful"],
-    anaplan: ["Anaplan"],
-    pigment: ["Pigment"],
-    vena: ["Vena Solutions", "Vena"],
-    board: ["Board International", "Board"],
-    prophix: ["Prophix"],
-    jedox: ["Jedox"],
-  };
-
-  const expansions = KNOWN_EXPANSIONS[token];
-  if (expansions) {
-    for (const exp of expansions) {
-      if (!variants.includes(exp)) variants.push(exp);
-    }
-  }
-
-  return variants;
-}
-
-// ===== Live visual crawling — strict competitor-only media (no viewport screenshots) =====
-function sanitizeSlug(value: string, fallback = "item"): string {
-  const slug = value.toLowerCase().replace(/https?:\/\//g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
-  return slug || fallback;
-}
-
-function extractHostname(url: string): string | null {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return null;
-  }
-}
-
-function extFromContentType(contentType: string | null): string {
-  if (!contentType) return "png";
-  if (contentType.includes("image/jpeg")) return "jpg";
-  if (contentType.includes("image/webp")) return "webp";
-  if (contentType.includes("image/gif")) return "gif";
-  if (contentType.includes("image/png")) return "png";
-  return "png";
-}
-
-function isAllowedDomain(hostname: string | null, allowedDomains: Set<string>): boolean {
-  if (!hostname) return false;
-  for (const allowed of allowedDomains) {
-    if (hostname === allowed || hostname.endsWith(`.${allowed}`)) return true;
-  }
-  return false;
-}
-
-function isLikelyProductUiImage(url: string, altText = ""): boolean {
-  const lower = url.toLowerCase();
-  const alt = altText.toLowerCase();
-
-  // REJECT: Images hosted on video platforms (always thumbnails/logos, never product UI)
-  if (/(?:youtube\.com|youtu\.be|ytimg\.com|ggpht\.com|vimeocdn\.com|wistia\.(?:com|net)|vidyard\.com|loom\.com)/i.test(lower)) return false;
-
-  // REJECT: SVGs (almost always icons/logos)
-  if (/\.(svg)(\?|$)/i.test(lower)) return false;
-
-  // REJECT: Common non-product image patterns in URLs
-  if (/\b(icon|favicon|avatar|badge|logo|pixel|sprite|banner|hero|thumbnail|thumb|social|sharing|og-image|twitter|facebook|linkedin)\b/.test(lower)) return false;
-  if (/\b(blog|news|press|careers|about|contact|team|partner|customer-logo|testimonial)\b/.test(lower)) return false;
-
-  // REJECT: Tracking pixels, spacers, decorative elements
-  if (/\b(spacer|divider|arrow|bullet|check|star|rating|gradient|background|bg-|pattern)\b/.test(lower)) return false;
-
-  // REJECT: Very small images (1x1, 2x2, etc.) indicated by URL patterns
-  if (/[_-](\d{1,2})x(\d{1,2})\b/.test(lower)) return false;
-
-  // PREFER: Alt text that suggests product UI content
-  const productAltSignals = /\b(screenshot|screen shot|dashboard|interface|dialog|modal|wizard|configuration|settings|panel|form|report|chart|graph|workflow|module|view|editor|builder|designer|canvas|grid|table|workspace)\b/i;
-  const hasProductAlt = productAltSignals.test(alt);
-
-  // REQUIRE: Must be an image file type
-  const isImageFile = /\.(png|jpe?g|gif|webp)(\?|$)/i.test(lower) || lower.includes("/images/") || lower.includes("/media/");
-  if (!isImageFile) return false;
-
-  // If alt text strongly suggests product UI, accept
-  if (hasProductAlt) return true;
-
-  // REJECT: Images from marketing/landing page paths
-  if (/\/(header|footer|nav|sidebar|cta|promo|offer|campaign|marquee)\//i.test(lower)) return false;
-
-  // Accept remaining images — the persist step will do a size check
-  return true;
-}
-
-/** Check if a cached screenshot URL is a viewport capture of a text-heavy page (low value)
- *  vs an inline product UI image (high value) */
-function isHighValueCachedScreenshot(screenshotUrl: string): boolean {
-  const lower = screenshotUrl.toLowerCase();
-
-  // ACCEPT: External product images hosted on competitor domains (e.g. oracle.com/a/ocom/img/...)
-  // These are official product UI screenshots from product pages
-  if (!lower.includes("competitor-screenshots") && /^https?:\/\//.test(lower)) {
-    // It's an external URL stored directly — accept it (already vetted during crawl)
-    return true;
-  }
-
-  // REJECT: Ambient crawler viewport captures (filename pattern: ambient-*)
-  // These are full-page viewport screenshots of doc/help pages — almost always just text
-  if (/\/ambient-/.test(lower)) return false;
-
-  // REJECT: Firecrawl viewport screenshots (contain "screenshot-" UUID pattern from storage.googleapis.com)
-  // These are full-page captures that show text-heavy pages, not product UI
-  if (/storage\.googleapis\.com\/firecrawl-scrape-media\/screenshot-/i.test(lower)) return false;
-
-  // REJECT: Generic viewport captures that aren't inline product images
-  // Only accept inline images (filename pattern: inline-*) from doc/help domains
-  if (/\/inline-/.test(lower)) {
-    // Reject inline images from marketing/product landing pages
-    if (/inline-\d+-www-/.test(lower) && !/inline-\d+-(docs|help|kb|support|community)-/.test(lower)) return false;
-    return true;
-  }
-
-  // REJECT: Live crawl viewport screenshots (not inline)
-  if (/\/live-/.test(lower) && !/\/live-.*inline/i.test(lower)) return false;
-
-  // ACCEPT: Any other storage images (manually uploaded, etc.)
-  return true;
-}
-
-// Well-known CDN domains that host legitimate product documentation images
-const KNOWN_DOC_CDN_DOMAINS = [
-  "cdn.document360.io",        // Pigment KB, many SaaS doc sites
-  "d2slcw3kip6qmk.cloudfront.net", // Common doc CDN
-  "images.ctfassets.net",       // Contentful CDN
-  "cdn.sanity.io",              // Sanity CDN
-  "res.cloudinary.com",         // Cloudinary CDN
-  "cdn.prod.website-files.com", // Webflow CDN
-];
-
-async function getAllowedCompetitorDomains(
-  supaClient: ReturnType<typeof createClient>,
-  competitor: string,
-): Promise<Set<string>> {
-  const domains = new Set<string>();
-
-  // Always allow known documentation CDN domains for inline images
-  for (const cdn of KNOWN_DOC_CDN_DOMAINS) {
-    domains.add(cdn);
-  }
-
-  const { data: compRows } = await supaClient
-    .from("competitors")
-    .select("website")
-    .eq("name", competitor)
-    .limit(1);
-
-  const website = compRows?.[0]?.website;
-  if (website) {
-    const host = extractHostname(website.startsWith("http") ? website : `https://${website}`);
-    if (host) domains.add(host);
-  }
-
-  // Also add common KB/docs subdomains for the competitor
-  const competitorToken = competitor.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (competitorToken) {
-    domains.add(`${competitorToken}.com`);
-    domains.add(`kb.${competitorToken}.com`);
-    domains.add(`docs.${competitorToken}.com`);
-    domains.add(`help.${competitorToken}.com`);
-    domains.add(`support.${competitorToken}.com`);
-    domains.add(`community.${competitorToken}.com`);
-  }
-
-  // For competitors with known alternative domains (e.g. Pigment → gopigment.com + kb.pigment.com)
-  // Add KB variants of the base name without common prefixes
-  const baseName = competitor.toLowerCase().replace(/^(go|try|get|use|app)/, "").replace(/[^a-z0-9]/g, "");
-  if (baseName && baseName !== competitorToken) {
-    domains.add(`${baseName}.com`);
-    domains.add(`kb.${baseName}.com`);
-    domains.add(`docs.${baseName}.com`);
-    domains.add(`community.go${baseName}.com`);
-  }
-
-  // Also search for pages under name variants (e.g. "Oracle EPM Cloud" pages for "Oracle")
-  const nameVariants = getCompetitorNameVariants(competitor);
-  for (const variant of nameVariants) {
-    const { data: pageRows } = await supaClient
-      .from("competitor_pages")
-      .select("page_url")
-      .eq("competitor_name", variant)
-      .limit(100);
-
-    for (const row of pageRows || []) {
-      const host = extractHostname(row.page_url || "");
-      if (host) domains.add(host);
-    }
-  }
-
-  return domains;
-}
-
-async function getBlockedCompetitorTokens(
-  supaClient: ReturnType<typeof createClient>,
-  competitor: string,
-): Promise<string[]> {
-  const { data } = await supaClient
-    .from("competitors")
-    .select("name")
-    .neq("name", competitor)
-    .limit(200);
-
-  return (data || [])
-    .map((r) => (r.name || "").toLowerCase().replace(/[^a-z0-9]/g, ""))
-    .filter((t) => t.length >= 4);
-}
-
-async function persistImageToPermanentStorage(
-  supaClient: ReturnType<typeof createClient>,
-  supabaseUrl: string,
-  competitor: string,
-  sourcePageUrl: string,
-  imageRef: string,
-  index: number,
-): Promise<string | null> {
-  try {
-    const competitorSlug = sanitizeSlug(competitor, "competitor");
-    const pageSlug = sanitizeSlug(sourcePageUrl || "live-crawl", "live-crawl");
-
-    const imgRes = await fetch(imageRef, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; chat-analysis-live-crawler/1.0)" },
-    });
-    if (!imgRes.ok) return null;
-
-    const fetchedType = (imgRes.headers.get("content-type") || "").split(";")[0].toLowerCase();
-    if (!fetchedType.startsWith("image/") || fetchedType === "image/svg+xml") return null;
-
-    const bytes = new Uint8Array(await imgRes.arrayBuffer());
-    // Reject images under 15KB — too small to be meaningful product UI screenshots
-    if (bytes.length < 15000) {
-      console.log(`Rejected image (too small: ${bytes.length} bytes): ${imageRef.slice(0, 100)}`);
-      return null;
-    }
-
-    const ext = extFromContentType(fetchedType);
-    const filePath = `${competitorSlug}/live-${pageSlug}-${Date.now()}-${index}.${ext}`;
-
-    const { data: uploadData, error: uploadErr } = await supaClient.storage
-      .from("competitor-screenshots")
-      .upload(filePath, bytes, { contentType: fetchedType || "image/png", upsert: true });
-
-    if (uploadErr || !uploadData?.path) {
-      console.error("Live crawl image persist failed:", uploadErr?.message || "unknown upload error");
-      return null;
-    }
-
-    return `${supabaseUrl}/storage/v1/object/public/competitor-screenshots/${uploadData.path}`;
-  } catch (err) {
-    console.error("persistImageToPermanentStorage error:", err);
-    return null;
-  }
-}
-
-/** Standalone YouTube video search — runs independently of image crawl decisions */
-async function searchYouTubeVideos(
-  competitor: string, category: string, subCategory: string
-): Promise<string[]> {
-  if (!hasFirecrawlKey()) return [];
-
-  const isFullProduct = category === "Full Product" && subCategory === "Full Product";
-  const ytSearchQueries = isFullProduct
-    ? [
-        `"${competitor}" EPM planning demo site:youtube.com`,
-        `"${competitor}" financial planning software overview site:youtube.com`,
-      ]
-    : [
-        `"${competitor}" "${subCategory}" demo site:youtube.com`,
-        `"${competitor}" ${category} tutorial walkthrough site:youtube.com`,
-      ];
-  const seenVideoIds = new Set<string>();
-  const videoRefs: string[] = [];
-
-  for (const ytQuery of ytSearchQueries) {
-    try {
-      console.log(`YouTube search query: ${ytQuery}`);
-      const res = await firecrawlFetch("https://api.firecrawl.dev/v1/search", {
-        method: "POST",
-        body: JSON.stringify({ query: ytQuery, limit: 5 }),
-      });
-      if (!res.ok) {
-        console.log(`YouTube search returned ${res.status} for: ${ytQuery}`);
-        continue;
-      }
-      const data = await res.json();
-      for (const result of (data.data || data.results || [])) {
-        if (!result.url) continue;
-        const ytMatch = result.url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
-        if (!ytMatch || seenVideoIds.has(ytMatch[1])) continue;
-
-        // Validate: title must contain competitor name (case-insensitive)
-        // Use tokens of length >= 2 to catch short acronyms like "EPM", "SAP", "AI"
-        const title = (result.title || "").toLowerCase();
-        const competitorTokens = competitor.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
-        const titleMatchesCompetitor = competitorTokens.some(token => title.includes(token));
-        if (!titleMatchesCompetitor) {
-          console.log(`YouTube REJECTED (title doesn't match "${competitor}"): ${result.title}`);
-          continue;
-        }
-
-        seenVideoIds.add(ytMatch[1]);
-        const videoUrl = `https://www.youtube.com/watch?v=${ytMatch[1]}`;
-        const label = result.title || `${competitor} ${subCategory} video`;
-        videoRefs.push(`[YouTube Search Video] ${label}: ${videoUrl}`);
-        console.log(`YouTube search found: ${videoUrl} — ${label}`);
-      }
-      if (seenVideoIds.size >= 4) break;
-    } catch (e) {
-      console.error("YouTube search error:", e);
-    }
-  }
-
-  return videoRefs;
-}
-
-async function crawlForRelevantMedia(
-  competitor: string, category: string, subCategory: string
-): Promise<{ mediaRefs: string[]; newPages: string[] }> {
-  const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!hasFirecrawlKey() || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    return { mediaRefs: [], newPages: [] };
-  }
-
-  const supaClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-  const allowedDomains = await getAllowedCompetitorDomains(supaClient, competitor);
-  const blockedCompetitorTokens = await getBlockedCompetitorTokens(supaClient, competitor);
-  const queries = buildSearchQueries(competitor, category, subCategory);
-  const mediaRefs: string[] = [];
-  const newPages: string[] = [];
-  const persistedUrlSet = new Set<string>();
-
-  console.log(`Live crawl for "${competitor}" / "${subCategory}" with ${queries.length} semantic queries`);
-  console.log(`Allowed competitor domains: ${[...allowedDomains].join(", ")}`);
-
-  const searchResults: { url: string; title: string; markdown?: string }[] = [];
-  const seenResultUrls = new Set<string>();
-
-  const searchPromises = queries.slice(0, 2).map(async (query) => {
-    try {
-      const domainHint = [...allowedDomains].slice(0, 2).map((d) => `site:${d}`).join(" ");
-      const res = await firecrawlFetch("https://api.firecrawl.dev/v1/search", {
-        method: "POST",
-        body: JSON.stringify({
-          query: `${query} ${domainHint}`.trim(),
-          limit: 4,
-          scrapeOptions: { formats: ["markdown"] },
-        }),
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      for (const result of (data.data || data.results || [])) {
-        if (!result.url || seenResultUrls.has(result.url)) continue;
-
-        const resultHost = extractHostname(result.url);
-        if (!isAllowedDomain(resultHost, allowedDomains)) continue;
-
-        const isRelevant = isPageSemanticlyRelevant(
-          {
-            title: result.title || "",
-            page_url: result.url,
-            content_summary: (result.markdown || result.description || "").slice(0, 1000),
-          },
-          category,
-          subCategory,
-        );
-        if (!isRelevant) continue;
-
-        seenResultUrls.add(result.url);
-        searchResults.push({ url: result.url, title: result.title || result.url, markdown: result.markdown || "" });
-      }
-    } catch (e) {
-      console.error("Live search error:", e);
-    }
-  });
-
-  await Promise.all(searchPromises);
-
-  // Fallback: if strict-domain search yields nothing, run semantic web search without domain restriction
-  if (searchResults.length === 0) {
-    console.log("Strict domain search returned 0; running semantic fallback search");
-    const fallbackPromises = queries.slice(0, 2).map(async (query) => {
-      try {
-        const res = await firecrawlFetch("https://api.firecrawl.dev/v1/search", {
-          method: "POST",
-          body: JSON.stringify({ query, limit: 6, scrapeOptions: { formats: ["markdown"] } }),
-        });
-        if (!res.ok) return;
-        const data = await res.json();
-        for (const result of (data.data || data.results || [])) {
-          if (!result.url || seenResultUrls.has(result.url)) continue;
-
-          const combined = `${(result.title || "").toLowerCase()} ${(result.url || "").toLowerCase()} ${((result.markdown || result.description || "") as string).toLowerCase()}`;
-          if (blockedCompetitorTokens.some((token) => combined.includes(token))) continue;
-
-          const isRelevant = isPageSemanticlyRelevant(
-            {
-              title: result.title || "",
-              page_url: result.url,
-              content_summary: (result.markdown || result.description || "").slice(0, 1000),
-            },
-            category,
-            subCategory,
-          );
-          if (!isRelevant) continue;
-
-          seenResultUrls.add(result.url);
-          searchResults.push({ url: result.url, title: result.title || result.url, markdown: result.markdown || "" });
-        }
-      } catch (e) {
-        console.error("Live search fallback error:", e);
-      }
-    });
-    await Promise.all(fallbackPromises);
-  }
-
-  // Step 2: scrape relevant pages and persist only inline product images (no viewport screenshot capture)
-  // For video-only competitors (e.g. Planful), skip image scraping entirely — only YouTube videos matter
-  const videoOnly = isVideoOnlyCompetitor(competitor);
-  if (searchResults.length > 0 && !videoOnly) {
-    // Filter out YouTube/video platform URLs — we only want their video IDs, not to scrape their pages for images
-    const scrapableResults = searchResults.filter(r => {
-      const isVideoPage = /(?:youtube\.com|youtu\.be|vimeo\.com|wistia\.com|vidyard\.com|loom\.com)/i.test(r.url);
-      if (isVideoPage) {
-        console.log(`Skipping scrape of video platform URL (extracting videos only): ${r.url}`);
-      }
-      return !isVideoPage;
-    });
-
-    const scrapePromises = scrapableResults.slice(0, 4).map(async ({ url, title, markdown: seedMarkdown }) => {
-      try {
-        const res = await firecrawlFetch("https://api.firecrawl.dev/v1/scrape", {
-          method: "POST",
-          body: JSON.stringify({
-            url,
-            formats: ["markdown", "html"],
-            onlyMainContent: true,
-          }),
-        });
-        if (!res.ok) return;
-        const data = await res.json();
-        const scrapeData = data.data || data;
-        const markdown = scrapeData.markdown || seedMarkdown || "";
-        const html = scrapeData.html || "";
-        const combined = `${markdown}\n${html}`;
-
-        // Extract ALL video URLs from scraped content — YouTube, Vimeo, Wistia, Vidyard, direct video files
-        const videoRegexes = [
-          /https?:\/\/(?:www\.)?youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)/gi,
-          /https?:\/\/(?:www\.)?youtube\.com\/embed\/([a-zA-Z0-9_-]+)/gi,
-          /https?:\/\/youtu\.be\/([a-zA-Z0-9_-]+)/gi,
-        ];
-        const vimeoRegex = /https?:\/\/(?:www\.)?(?:player\.)?vimeo\.com\/(?:video\/)?(\d+)/gi;
-        const wistiaRegex = /https?:\/\/[^"'\s]+\.wistia\.com\/(?:medias|embed\/iframe)\/([a-zA-Z0-9]+)/gi;
-        const vidyardRegex = /https?:\/\/[^"'\s]*vidyard\.com\/(?:watch|share|embed)\/([a-zA-Z0-9]+)/gi;
-
-        // Also find video links inside <a href="..."> tags pointing to YouTube
-        const linkVideoRegex = /<a[^>]+href=["'](https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)[^"']*?)["'][^>]*>/gi;
-
-        // Direct video file URLs (.mp4, .webm, .mov, .ogg)
-        const directVideoRegex = /(https?:\/\/[^\s"'<>]+\.(?:mp4|webm|mov|ogg)(?:\?[^\s"'<>]*)?)/gi;
-
-        // <video> tag sources
-        const videoTagRegex = /<(?:video|source)[^>]+src=["']([^"']+\.(?:mp4|webm|mov|ogg)(?:\?[^"']*)?)["'][^>]*>/gi;
-
-        // Loom video URLs
-        const loomRegex = /https?:\/\/(?:www\.)?loom\.com\/(?:share|embed)\/([a-zA-Z0-9]+)/gi;
-
-        for (const re of videoRegexes) {
-          let vm;
-          while ((vm = re.exec(combined)) !== null) {
-            if (!seenVideoIds.has(vm[1])) {
-              seenVideoIds.add(vm[1]);
-              const videoUrl = `https://www.youtube.com/watch?v=${vm[1]}`;
-              mediaRefs.push(`[Live Crawl Video] ${title || competitor} - ${subCategory}: ${videoUrl}`);
-              if (!newPages.includes(url)) newPages.push(url);
-            }
-          }
-        }
-
-        // Vimeo
-        let vimeoMatch;
-        while ((vimeoMatch = vimeoRegex.exec(combined)) !== null) {
-          const vimeoId = vimeoMatch[1];
-          if (!seenVideoIds.has(`vimeo-${vimeoId}`)) {
-            seenVideoIds.add(`vimeo-${vimeoId}`);
-            mediaRefs.push(`[Live Crawl Video] ${title || competitor} - ${subCategory}: https://vimeo.com/${vimeoId}`);
-            if (!newPages.includes(url)) newPages.push(url);
-          }
-        }
-
-        // Wistia
-        let wistiaMatch;
-        while ((wistiaMatch = wistiaRegex.exec(combined)) !== null) {
-          const wistiaId = wistiaMatch[1];
-          if (!seenVideoIds.has(`wistia-${wistiaId}`)) {
-            seenVideoIds.add(`wistia-${wistiaId}`);
-            mediaRefs.push(`[Live Crawl Video] ${title || competitor} Wistia - ${subCategory}: ${wistiaMatch[0]}`);
-            if (!newPages.includes(url)) newPages.push(url);
-          }
-        }
-
-        // Vidyard
-        let vidyardMatch;
-        while ((vidyardMatch = vidyardRegex.exec(combined)) !== null) {
-          const vidyardId = vidyardMatch[1];
-          if (!seenVideoIds.has(`vidyard-${vidyardId}`)) {
-            seenVideoIds.add(`vidyard-${vidyardId}`);
-            mediaRefs.push(`[Live Crawl Video] ${title || competitor} Vidyard - ${subCategory}: ${vidyardMatch[0]}`);
-            if (!newPages.includes(url)) newPages.push(url);
-          }
-        }
-
-        // Direct video files (.mp4, .webm, .mov, .ogg)
-        let directMatch;
-        while ((directMatch = directVideoRegex.exec(combined)) !== null) {
-          const videoFileUrl = directMatch[1];
-          const dedupeKey = `direct-${videoFileUrl.replace(/\?.*$/, "")}`;
-          if (!seenVideoIds.has(dedupeKey)) {
-            seenVideoIds.add(dedupeKey);
-            mediaRefs.push(`[Live Crawl Video] ${title || competitor} direct video - ${subCategory}: ${videoFileUrl}`);
-            if (!newPages.includes(url)) newPages.push(url);
-            console.log(`Direct video file found: ${videoFileUrl.slice(0, 120)}`);
-          }
-        }
-
-        // <video> tag sources
-        let videoTagMatch;
-        while ((videoTagMatch = videoTagRegex.exec(combined)) !== null) {
-          let videoSrc = videoTagMatch[1];
-          try { videoSrc = new URL(videoSrc, url).toString(); } catch { continue; }
-          const dedupeKey = `vtag-${videoSrc.replace(/\?.*$/, "")}`;
-          if (!seenVideoIds.has(dedupeKey)) {
-            seenVideoIds.add(dedupeKey);
-            mediaRefs.push(`[Live Crawl Video] ${title || competitor} embedded video - ${subCategory}: ${videoSrc}`);
-            if (!newPages.includes(url)) newPages.push(url);
-            console.log(`Video tag source found: ${videoSrc.slice(0, 120)}`);
-          }
-        }
-
-        // Loom videos
-        let loomMatch;
-        while ((loomMatch = loomRegex.exec(combined)) !== null) {
-          const loomId = loomMatch[1];
-          if (!seenVideoIds.has(`loom-${loomId}`)) {
-            seenVideoIds.add(`loom-${loomId}`);
-            mediaRefs.push(`[Live Crawl Video] ${title || competitor} Loom - ${subCategory}: https://www.loom.com/share/${loomId}`);
-            if (!newPages.includes(url)) newPages.push(url);
-          }
-        }
-
-        // Link-based YouTube references (e.g. <a href="youtube.com/watch?v=...">)
-        let linkMatch;
-        while ((linkMatch = linkVideoRegex.exec(combined)) !== null) {
-          const ytId = linkMatch[2];
-          if (ytId && !seenVideoIds.has(ytId)) {
-            seenVideoIds.add(ytId);
-            const videoUrl = `https://www.youtube.com/watch?v=${ytId}`;
-            mediaRefs.push(`[Live Crawl Video] ${title || competitor} linked video - ${subCategory}: ${videoUrl}`);
-            if (!newPages.includes(url)) newPages.push(url);
-          }
-        }
-
-        // Also extract animated GIFs as media (they often show product workflows)
-        const gifRegex = /(https?:\/\/[^\s"'<>]+\.gif(?:\?[^\s"'<>]*)?)/gi;
-        let gifMatch;
-        const seenGifs = new Set<string>();
-        while ((gifMatch = gifRegex.exec(combined)) !== null) {
-          const gifUrl = gifMatch[1];
-          const normalizedGif = gifUrl.replace(/\?.*$/, "");
-          if (seenGifs.has(normalizedGif)) continue;
-          seenGifs.add(normalizedGif);
-          // Only persist GIFs that pass the product UI filter
-          if (!isLikelyProductUiImage(gifUrl, "")) continue;
-          const persistedGif = await persistImageToPermanentStorage(
-            supaClient, SUPABASE_URL, competitor, url, gifUrl, mediaRefs.length + 1,
-          );
-          if (persistedGif && !persistedUrlSet.has(persistedGif)) {
-            persistedUrlSet.add(persistedGif);
-            mediaRefs.push(`[Live Crawl GIF] ${title || competitor} animated demo - ${subCategory}: ${persistedGif}`);
-            if (!newPages.includes(url)) newPages.push(url);
-            console.log(`Animated GIF persisted: ${persistedGif.slice(0, 120)}`);
-          }
-        }
-
-        const rawMarkdownMatches = [...markdown.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/gi)];
-        const rawHtmlMatches = [...html.matchAll(/<img[^>]+src=["']([^"']+)["'][^>]*?(?:alt=["']([^"']*)["'])?[^>]*>/gi)];
-
-        const imageCandidates: Array<{ altText: string; imgUrl: string }> = [];
-        const seenCandidateUrls = new Set<string>();
-
-        for (const m of rawMarkdownMatches) {
-          const altText = (m[1] || "").toLowerCase();
-          const rawUrl = (m[2] || "").trim();
-          if (!rawUrl) continue;
-          let imgUrl = rawUrl;
-          try { imgUrl = new URL(rawUrl, url).toString(); } catch { continue; }
-          if (!/^https?:\/\//i.test(imgUrl)) continue;
-          if (seenCandidateUrls.has(imgUrl)) continue;
-          seenCandidateUrls.add(imgUrl);
-          imageCandidates.push({ altText, imgUrl });
-        }
-
-        for (const m of rawHtmlMatches) {
-          const rawUrl = (m[1] || "").trim();
-          const htmlAlt = (m[2] || "").toLowerCase();
-          if (!rawUrl) continue;
-          let imgUrl = rawUrl;
-          try { imgUrl = new URL(rawUrl, url).toString(); } catch { continue; }
-          if (!/^https?:\/\//i.test(imgUrl)) continue;
-          if (seenCandidateUrls.has(imgUrl)) continue;
-          seenCandidateUrls.add(imgUrl);
-          imageCandidates.push({ altText: htmlAlt, imgUrl });
-        }
-
-        if (imageCandidates.length === 0) return;
-        let inlineCount = 0;
-
-        for (const candidate of imageCandidates) {
-          const altText = candidate.altText;
-          const imgUrl = candidate.imgUrl;
-          if (!imgUrl || !isLikelyProductUiImage(imgUrl, altText)) continue;
-
-          const combined = `${altText} ${imgUrl.toLowerCase()} ${(title || "").toLowerCase()} ${url.toLowerCase()}`;
-          if (blockedCompetitorTokens.some((token) => combined.includes(token))) continue;
-
-          const persistedInline = await persistImageToPermanentStorage(
-            supaClient,
-            SUPABASE_URL,
-            competitor,
-            url,
-            imgUrl,
-            mediaRefs.length + inlineCount + 1,
-          );
-          inlineCount += 1;
-
-          if (persistedInline && !persistedUrlSet.has(persistedInline)) {
-            persistedUrlSet.add(persistedInline);
-            mediaRefs.push(`[Live Crawl Inline] ${title || competitor} - ${subCategory}: ${persistedInline}`);
-            if (!newPages.includes(url)) newPages.push(url);
-          }
-
-          if (inlineCount >= 5) break;
-        }
-      } catch (e) {
-        console.error("Live scrape error:", e);
-      }
-    });
-
-    await Promise.all(scrapePromises);
-  }
-
-  console.log(`Live crawl found ${mediaRefs.length} media items from ${newPages.length} new pages`);
-  for (const ref of mediaRefs) {
-    console.log(`  MEDIA: ${ref.slice(0, 200)}`);
-  }
-  return { mediaRefs, newPages };
-}
-
-// ===== Gallery-first media lookup =====
-// Check media_assets table for existing media before triggering any crawl
-
-interface GalleryMediaResult {
-  galleryMedia: string[];       // formatted media lines for prompt
-  galleryUrls: Set<string>;     // raw URLs already in gallery (for dedup)
-  count: number;
-  /** For Full Product: map of product_sub_area → count */
-  subAreaCounts?: Record<string, number>;
-}
-
-async function getGalleryMedia(
-  competitor: string,
-  category: string,
-  subCategory: string,
-): Promise<GalleryMediaResult> {
-  const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    return { galleryMedia: [], galleryUrls: new Set(), count: 0 };
-  }
-
-  const supaClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-  const nameVariants = getCompetitorNameVariants(competitor);
-  const isFullProduct = category === "Full Product" && subCategory === "Full Product";
-
-  let query = supaClient
-    .from("media_assets")
-    .select("id, competitor_name, product_area, product_sub_area, storage_url, cdn_url, media_type, alt_text, source_type, metadata, page_url")
-    .in("competitor_name", nameVariants)
-    .eq("is_active", true)
-    .order("created_at", { ascending: false });
-
-  // For specific product areas, filter to that area; for Full Product, get all
-  if (!isFullProduct) {
-    query = query.eq("product_area", category).eq("product_sub_area", subCategory);
-  }
-
-  const { data: assets, error } = await query.limit(50);
-
-  // If specific sub-area returns 0 results, return empty — don't broaden to other areas
-  if ((!assets || assets.length === 0) && !isFullProduct) {
-    console.log(`Gallery lookup: 0 assets for "${competitor}" / "${subCategory}" — returning empty (no fallback)`);
-    return { galleryMedia: [], galleryUrls: new Set(), count: 0 };
-  }
-
-  if (!assets || assets.length === 0) {
-    console.log(`Gallery lookup: 0 assets for "${competitor}" (Full Product)`);
-    return { galleryMedia: [], galleryUrls: new Set(), count: 0 };
-  }
-
-  if (error || !assets || assets.length === 0) {
-    console.log(`Gallery lookup: 0 assets for "${competitor}" / "${subCategory}"`);
-    return { galleryMedia: [], galleryUrls: new Set(), count: 0 };
-  }
-
-  return buildGalleryResult(assets, competitor, isFullProduct, isFullProduct ? "Full Product" : subCategory);
-}
-
-function buildGalleryResult(
-  assets: any[],
-  competitor: string,
-  isFullProduct: boolean,
-  labelContext: string,
-): GalleryMediaResult {
-  const galleryMedia: string[] = [];
-  const galleryUrls = new Set<string>();
-  const subAreaCounts: Record<string, number> = {};
-
-  for (const asset of assets) {
-    const storageUrl = asset.storage_url || "";
-    const cdnUrl = asset.cdn_url || "";
-    const isPermanentStorage = storageUrl.includes("supabase.co/storage/");
-    const url = isPermanentStorage ? storageUrl : (cdnUrl || storageUrl);
-    if (!url) continue;
-    const normalizedUrl = url.replace(/\?.*$/, "");
-    if (galleryUrls.has(normalizedUrl)) continue;
-    galleryUrls.add(normalizedUrl);
-
-    const subArea = asset.product_sub_area || "Unknown";
-    subAreaCounts[subArea] = (subAreaCounts[subArea] || 0) + 1;
-
-    const isVideo = asset.media_type === "video" || /\.(?:mp4|webm|mov)(?:\?|$)/i.test(url) ||
-      url.includes("youtube.com") || url.includes("youtu.be") || url.includes("vimeo.com");
-    const label = asset.alt_text || `${asset.competitor_name} ${asset.product_sub_area} - ${asset.media_type}`;
-    const pageUrlSuffix = asset.page_url ? ` (from ${asset.page_url})` : "";
-
-    if (isVideo) {
-      galleryMedia.push(`[Gallery Video] ${label}${pageUrlSuffix}: ${url}`);
-    } else {
-      galleryMedia.push(`[Gallery Image] ${label}${pageUrlSuffix}: ${url}`);
-    }
-  }
-
-  console.log(`Gallery lookup: ${galleryMedia.length} active assets for "${competitor}" / "${labelContext}"`);
-  return { galleryMedia, galleryUrls, count: galleryMedia.length, subAreaCounts };
-}
-
-/** For Full Product: determine which product sub-areas are missing media and optionally trigger bulk-media-crawl */
-async function handleFullProductMediaThreshold(
-  competitor: string,
-  galleryResult: GalleryMediaResult,
-): Promise<{ skipCrawl: boolean; missingSubAreas: string[] }> {
-  const totalCount = galleryResult.count;
-
-  // All known product sub-areas from the taxonomy
-  const ALL_SUB_AREAS = [
-    "Web-Based Matrix Reporting", "OfficeConnect", "Workday for Google Sheets",
-    "Dashboards & Visualization", "Ad-Hoc Analysis",
-    "Elastic Hypercube Technology", "Standard Sheets", "Cube Sheets",
-    "Modeled Sheets", "Dimensions & Attributes",
-    "Predictive Forecaster", "Anomaly Detection", "Planning Agent",
-    "Data Integration", "Drill-Through",
-    "Process Tracker", "Workflow", "Cell Notes & Audit Trail",
-    "Workforce Planning", "Sales Planning", "Consolidation",
-  ];
-
-  if (totalCount > 8) {
-    console.log(`Full Product media threshold: ${totalCount} > 8 — skipping media crawl for "${competitor}"`);
-    return { skipCrawl: true, missingSubAreas: [] };
-  }
-
-  // Find sub-areas with zero media
-  const coveredSubAreas = new Set(Object.keys(galleryResult.subAreaCounts || {}));
-  const missingSubAreas = ALL_SUB_AREAS.filter(sa => !coveredSubAreas.has(sa));
-
-  if (totalCount === 0) {
-    console.log(`Full Product media threshold: 0 media — will trigger bulk crawl for ALL areas for "${competitor}"`);
-    // Trigger bulk-media-crawl for all product areas (fire-and-forget)
-    try {
-      const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-      const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
-        fetch(`${SUPABASE_URL}/functions/v1/bulk-media-crawl`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-          },
-          body: JSON.stringify({ competitor_name: competitor }),
-        }).catch(e => console.error("bulk-media-crawl trigger error:", e));
-        console.log(`Triggered bulk-media-crawl for "${competitor}" (all areas)`);
-      }
-    } catch (e) {
-      console.error("Failed to trigger bulk-media-crawl:", e);
-    }
-    return { skipCrawl: false, missingSubAreas: ALL_SUB_AREAS };
-  }
-
-  // 1-8 media: crawl only missing areas
-  console.log(`Full Product media threshold: ${totalCount} media (1-8) — will crawl ${missingSubAreas.length} missing areas for "${competitor}"`);
-  if (missingSubAreas.length > 0) {
-    try {
-      const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-      const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
-        fetch(`${SUPABASE_URL}/functions/v1/bulk-media-crawl`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-          },
-          body: JSON.stringify({ competitor_name: competitor, product_sub_areas: missingSubAreas }),
-        }).catch(e => console.error("bulk-media-crawl trigger error:", e));
-        console.log(`Triggered bulk-media-crawl for "${competitor}" — missing areas: ${missingSubAreas.join(", ")}`);
-      }
-    } catch (e) {
-      console.error("Failed to trigger bulk-media-crawl:", e);
-    }
-  }
-  return { skipCrawl: false, missingSubAreas };
-}
-
-// ===== Cached intelligence retrieval with semantic filtering =====
-
-async function getCachedIntelligence(
-  competitor: string, subCategory: string, category: string
-): Promise<{ intelligence: string; media: string; hasCachedData: boolean; hasRelevantMedia: boolean }> {
-  const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return { intelligence: "", media: "", hasCachedData: false, hasRelevantMedia: false };
-
-  const supaClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-  // Try exact match first, then fuzzy variants
-  const nameVariants = getCompetitorNameVariants(competitor);
-  console.log(`getCachedIntelligence: searching for "${competitor}" with variants: ${nameVariants.join(", ")}`);
-
-  const { data: pages } = await supaClient
-    .from("competitor_pages")
-    .select("content_summary, page_type, page_url, title, screenshot_urls, metadata")
-    .in("competitor_name", nameVariants)
-    .eq("crawl_status", "completed")
-    .not("content_summary", "is", null)
-    .order("content_updated_at", { ascending: false })
-    .limit(15);
-
-  if (!pages || pages.length === 0) return { intelligence: "", media: "", hasCachedData: false, hasRelevantMedia: false };
-
-  const intelligenceParts: string[] = [];
-  const mediaRefs: string[] = [];
-
-  for (const page of pages) {
-    if (page.content_summary) {
-      intelligenceParts.push(`[Pre-crawled ${page.page_type}: ${page.page_url}] ${page.content_summary.slice(0, 2000)}`);
-    }
-    // Only include screenshots that pass the quality gate
-    // For video-only competitors, skip all cached images — only videos are useful
-    if (page.screenshot_urls && page.screenshot_urls.length > 0 && !isVideoOnlyCompetitor(competitor)) {
-      const relevant = isPageSemanticlyRelevant(page, category, subCategory);
-      if (relevant) {
-        for (const sUrl of page.screenshot_urls) {
-          if (!isHighValueCachedScreenshot(sUrl)) {
-            console.log(`Quality gate REJECTED cached screenshot: ${sUrl.split("/").pop()}`);
-            continue;
-          }
-          const label = `${competitor} ${page.page_type || "page"} - ${page.title || "Product UI"}`;
-          mediaRefs.push(`[Official Image] ${label} (product screenshot): ${sUrl}`);
-        }
-      } else {
-        console.log(`Skipping ${page.screenshot_urls.length} screenshots from semantically irrelevant page: "${page.title}" for product area "${subCategory}"`);
-      }
-    }
-    // Extract video URLs from page metadata (stored by screenshot-worker)
-    const pageMeta = (page as any).metadata as Record<string, unknown> | null;
-    if (pageMeta && Array.isArray(pageMeta.video_urls) && pageMeta.video_urls.length > 0) {
-      const relevant = isPageSemanticlyRelevant(page, category, subCategory);
-      if (relevant) {
-        for (const vUrl of pageMeta.video_urls) {
-          if (typeof vUrl === "string" && vUrl.startsWith("http")) {
-            const label = `${competitor} ${page.title || "Product Video"} - ${subCategory}`;
-            mediaRefs.push(`[Official Video] ${label}: ${vUrl}`);
-          }
-        }
-        console.log(`Added ${pageMeta.video_urls.length} video URLs from page: "${page.title}"`);
-      }
-    }
-    // Also extract embedded video URLs from page content (may have been missed by screenshot-worker)
-    if (page.content_summary) {
-      const summary = page.content_summary;
-      const embeddedVideoRegexes = [
-        /https?:\/\/(?:www\.)?youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)/gi,
-        /https?:\/\/(?:www\.)?youtube\.com\/embed\/([a-zA-Z0-9_-]+)/gi,
-        /https?:\/\/youtu\.be\/([a-zA-Z0-9_-]+)/gi,
-      ];
-      for (const re of embeddedVideoRegexes) {
-        let vm;
-        while ((vm = re.exec(summary)) !== null) {
-          const videoUrl = `https://www.youtube.com/watch?v=${vm[1]}`;
-          if (!mediaRefs.some(r => r.includes(vm[1]))) {
-            const label = `${competitor} ${page.title || "Product Video"} - ${subCategory}`;
-            mediaRefs.push(`[Embedded Video] ${label}: ${videoUrl}`);
-          }
-        }
-      }
-    }
-  }
-
-  console.log(`Cached intelligence: ${pages.length} pages, ${intelligenceParts.length} summaries, ${mediaRefs.length} relevant screenshots for "${subCategory}"`);
-
-  const mediaContext = mediaRefs.length > 0
-    ? `--- AVAILABLE OFFICIAL MEDIA ---\nThe following ${mediaRefs.length} official images were found from ${competitor}'s official channels relevant to "${subCategory}". Include ALL of them in your Visual Overview section:\n\n${mediaRefs.join("\n")}\n--- END MEDIA ---`
-    : "";
-
-  return {
-    intelligence: intelligenceParts.join("\n\n"),
-    media: mediaContext,
-    hasCachedData: intelligenceParts.length > 0,
-    hasRelevantMedia: mediaRefs.length > 0,
-  };
-}
-
-// ===== Live intelligence gathering (only when no cache) =====
-async function gatherLiveIntelligenceAndMedia(
-  competitor: string, subCategory: string, category: string
-): Promise<{ intelligence: string; media: string }> {
-  const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
-
-  const productAreaDesc = getProductAreaDescription(category, subCategory);
-  const shortContext = productAreaDesc ? productAreaDesc.split(".").slice(0, 2).join(".") + "." : "";
-  const semanticHint = shortContext ? ` Focus on: ${shortContext}` : "";
-
-  const intelligenceResults: string[] = [];
-  const mediaRefs: string[] = [];
-  const competitorSlug = competitor.toLowerCase().replace(/\s+/g, "");
-
-  const parallelTasks: Promise<void>[] = [];
-
-  // Claude broad search
-  if (ANTHROPIC_API_KEY) {
-    parallelTasks.push(
-      claudeWebSearch(
-        `Find detailed info about "${competitor}" competing with Workday Adaptive Planning in ${subCategory} (${category}).${semanticHint} Include: features, pricing, integrations, architecture. Provide source URLs.`,
-        3
-      ).then(results => {
-        for (const r of results) intelligenceResults.push(r.slice(0, 1500));
-      })
-    );
-  }
-
-  if (hasFirecrawlKey()) {
-    // Firecrawl search
-    parallelTasks.push(
-      firecrawlFetch("https://api.firecrawl.dev/v1/search", {
-        method: "POST",
-        body: JSON.stringify({ query: `${competitor} ${subCategory} ${category} features capabilities`, limit: 3, scrapeOptions: { formats: ["markdown"] } }),
-      }).then(async r => {
-        if (!r.ok) return;
-        const d = await r.json();
-        for (const result of (d.data || d.results || [])) {
-          const content = result.markdown || result.description || "";
-          if (content) intelligenceResults.push(`[Firecrawl: ${result.url || ""}] ${content.slice(0, 1500)}`);
-        }
-      }).catch(e => console.error("Firecrawl error:", e))
-    );
-
-    // Firecrawl scrape competitor website
-    parallelTasks.push(
-      (async () => {
-        for (const prefix of ["www.", ""]) {
-          try {
-            const url = `https://${prefix}${competitorSlug}.com`;
-            const res = await firecrawlFetch("https://api.firecrawl.dev/v1/scrape", {
-              method: "POST",
-              body: JSON.stringify({ url, formats: ["markdown"], onlyMainContent: true }),
-            });
-            if (!res.ok) continue;
-            const data = await res.json();
-            const markdown = data.data?.markdown || data.markdown || "";
-            if (markdown) {
-              intelligenceResults.push(`[Scraped: ${url}] ${markdown.slice(0, 2000)}`);
-              break;
-            }
-          } catch { /* skip */ }
-        }
-      })()
-    );
-  }
-
-  await Promise.all(parallelTasks);
-
-  // Simple heuristic media filtering (no LLM validation — optimization D)
-  const finalMedia = mediaRefs.filter(ref => {
-    const url = ref.match(/https?:\/\/[^\s)]+/)?.[0] || "";
-    if (/\b(icon|favicon|avatar|badge|pixel|tracking|social)\b/i.test(url)) return false;
-    return true;
-  });
-
-  const mediaContext = finalMedia.length > 0
-    ? `--- AVAILABLE OFFICIAL MEDIA ---\n${finalMedia.join("\n")}\n--- END MEDIA ---`
-    : "";
-
-  return { intelligence: intelligenceResults.join("\n\n"), media: mediaContext };
-}
-
-// ===== Media Quality Agent integration =====
-// Calls the media-quality-agent edge function to rate all media items using AI vision
-// and discover additional YouTube videos. Only media scoring ≥7 is included.
-
-interface ParsedMediaItem {
-  url: string;
-  label: string;
-  type: "image" | "video" | "gif";
-  originalLine: string;
-}
-
-function parseMediaFromContext(mediaContext: string): ParsedMediaItem[] {
-  if (!mediaContext) return [];
-  const items: ParsedMediaItem[] = [];
-  const seenUrls = new Set<string>();
-
-  for (const line of mediaContext.split("\n")) {
-    const urlMatch = line.match(/(https?:\/\/[^\s)]+)/);
-    if (!urlMatch) continue;
-    const url = urlMatch[1];
-    const dedupeKey = url.replace(/\?.*$/, "");
-    if (seenUrls.has(dedupeKey)) continue;
-    seenUrls.add(dedupeKey);
-
-    const isVideo = url.includes("youtube.com/watch") || url.includes("youtu.be/") ||
-      url.includes("vimeo.com/") || url.includes("wistia.com/") ||
-      url.includes("vidyard.com/") || url.includes("loom.com/") ||
-      /\.(?:mp4|webm|mov|ogg)(?:\?|$)/i.test(url);
-    const isGif = /\.gif(?:\?|$)/i.test(url);
-    const isImage = !isVideo && (/\.(?:png|jpe?g|webp)(?:\?|$)/i.test(url) || url.includes("competitor-screenshots"));
-
-    if (!isVideo && !isGif && !isImage) continue;
-
-    // Extract label from the line
-    const labelMatch = line.match(/\]\s*(.+?)(?:\s*\(|:\s*https?)/);
-    const label = labelMatch ? labelMatch[1].trim() : line.replace(/https?:\/\/[^\s]+/g, "").replace(/[\[\]]/g, "").trim().slice(0, 120) || "Media item";
-
-    items.push({
-      url,
-      label,
-      type: isVideo ? "video" : isGif ? "gif" : "image",
-      originalLine: line,
-    });
-  }
-
-  return items;
-}
-
-async function filterMediaWithQualityAgent(
-  mediaContext: string,
-  competitor: string,
-  category: string,
-  subCategory: string,
-): Promise<string> {
-  if (!mediaContext) return "";
-
-  const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return mediaContext; // fallback: return unfiltered
-
-  const parsedMedia = parseMediaFromContext(mediaContext);
-  if (parsedMedia.length === 0) return mediaContext;
-
-  console.log(`Media Quality Agent: sending ${parsedMedia.length} items for AI evaluation`);
-
-  // Extract existing video IDs to avoid duplicates in discovery
-  const existingVideoIds: string[] = [];
-  for (const item of parsedMedia) {
-    if (item.type === "video") {
-      const match = item.url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
-      if (match) existingVideoIds.push(match[1]);
-    }
-  }
-
-  try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/media-quality-agent`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-      },
-      body: JSON.stringify({
-        competitor,
-        category,
-        subCategory,
-        mediaItems: parsedMedia.map(m => ({ url: m.url, label: m.label, type: m.type })),
-        existingVideoIds,
-      }),
-    });
-
-    if (!res.ok) {
-      console.error(`Media Quality Agent returned ${res.status}`);
-      return mediaContext; // fallback
-    }
-
-    const result = await res.json();
-    const approved = result.filteredMedia || [];
-    const rejected = result.rejectedMedia || [];
-    const discoveredVideos = result.discoveredVideos || [];
-
-    console.log(`Media Quality Agent verdict: ${approved.length} approved, ${rejected.length} rejected, ${discoveredVideos.length} new YT videos`);
-
-    // Rebuild media context with only approved items
-    const approvedUrls = new Set(approved.map((m: any) => m.url.replace(/\?.*$/, "")));
-    const filteredLines: string[] = [];
-
-    for (const item of parsedMedia) {
-      const normalizedUrl = item.url.replace(/\?.*$/, "");
-      if (approvedUrls.has(normalizedUrl)) {
-        filteredLines.push(item.originalLine);
-      }
-    }
-
-    // Add discovered YouTube videos
-    for (const video of discoveredVideos) {
-      const label = `${competitor} ${video.title} - ${subCategory}`;
-      filteredLines.push(`[Discovered Video] ${label}: ${video.url}`);
-    }
-
-    if (filteredLines.length === 0) return "";
-
-    return `--- AVAILABLE OFFICIAL MEDIA (AI-verified, score ≥7) ---\n${filteredLines.join("\n")}\n--- END MEDIA ---`;
-  } catch (err) {
-    console.error("Media Quality Agent call failed:", err);
-    return mediaContext; // fallback: return unfiltered
-  }
-}
-
-async function claudeWebSearch(query: string, maxUses = 3): Promise<string[]> {
-  const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!ANTHROPIC_API_KEY) return [];
-
-  try {
-    console.log("Claude web search:", query.slice(0, 120));
-    const res = await monitoredFetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 3000,
-        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: maxUses }],
-        messages: [{ role: "user", content: query }],
-      }),
-    }, { keyName: "ANTHROPIC_API_KEY", service: "anthropic", edgeFunction: "chat-analysis" });
-
-    if (!res.ok) {
-      console.error("Claude web search error:", res.status);
-      await res.text();
-      return [];
-    }
-
-    const data = await res.json();
-    const results: string[] = [];
-    for (const block of data.content || []) {
-      if (block.type === "text") results.push(block.text);
-      else if (block.type === "web_search_tool_result") {
-        for (const sr of block.content || []) {
-          if (sr.type === "web_search_result") {
-            results.push(`[Source: ${sr.url}] ${sr.title}: ${(sr.page_content || sr.encrypted_content || "").slice(0, 500)}`);
-          }
-        }
-      }
-    }
-    return results;
-  } catch (err) {
-    console.error("Claude web search error:", err);
-    return [];
-  }
-}
-
-// ===== OPTIMIZATION D: Simplified research router — no LLM call =====
-function needsResearch(message: string, history: any[]): boolean {
-  if (!history || history.length === 0) return true;
-  const lower = message.toLowerCase();
-  // Simple heuristic: if user asks about a different topic or requests new research
-  if (/\b(compare|analyze|tell me about|what about|how does|research|find|search|look up)\b/i.test(lower)) return true;
-  return false;
-}
-
-// ===== Intent detection: is the follow-up related to the competitive analysis context? =====
-function isFollowUpRelatedToAnalysis(
-  message: string,
-  competitor: string,
-  category: string,
-  subCategory: string,
-  history: any[],
-): boolean {
-  // First message is always related (it initiates the analysis)
-  if (!history || history.length === 0) return true;
-
-  const lower = message.toLowerCase();
-  const competitorLower = competitor.toLowerCase();
-  const categoryLower = category.toLowerCase();
-  const subCategoryLower = subCategory.toLowerCase();
-
-  // Check if the message mentions the competitor, category, or sub-category
-  const competitorTokens = competitorLower.split(/\s+/).filter(t => t.length >= 3);
-  const mentionsCompetitor = competitorTokens.some(t => lower.includes(t));
-  const mentionsCategory = lower.includes(categoryLower) || lower.includes(subCategoryLower);
-
-  // Check for competitive analysis / EPM / FP&A domain terms
-  const domainTerms = /\b(workday|adaptive|planning|epm|fpa|fp&a|forecast|budget|consolidat|report|model|sheet|cube|hcm|erp|saas|competitor|competitive|comparison|versus|vs\.?|strength|weakness|gap|feature|capability|integration|workflow|dashboard|analytics|ai\s+capabilit)\b/i;
-  const mentionsDomain = domainTerms.test(lower);
-
-  // Check for explicit references to "the analysis", "the comparison", "above", "previous", etc.
-  const referencesContext = /\b(the analysis|the comparison|the report|the response|above|previous|you mentioned|you said|earlier|that point|this area|those|these features|the table|the section)\b/i.test(lower);
-
-  // If any of these signals fire, it's related
-  if (mentionsCompetitor || mentionsCategory || mentionsDomain || referencesContext) return true;
-
-  // Check if the last assistant message in history is long (i.e. a full analysis) and
-  // the follow-up is short and generic — likely an independent question
-  const lastAssistant = [...(history || [])].reverse().find((m: any) => m.role === "assistant");
-  if (lastAssistant && lastAssistant.content && lastAssistant.content.length > 2000) {
-    // Long analysis context exists. If the follow-up doesn't match any domain signals, treat as independent.
-    return false;
-  }
-
-  // Default: treat as related for safety
-  return true;
-}
-
-interface JudgeEvaluation {
-  factual_correctness: { score: number; reasoning: string };
-  structural_clarity: { score: number; reasoning: string };
-  depth_of_comparison: { score: number; reasoning: string };
-  visual_evidence: { score: number; reasoning: string };
-  citation_coverage: { score: number; reasoning: string };
-  actionability: { score: number; reasoning: string };
-  media_quality: { score: number; reasoning: string };
-  overall_score: number;
-  overall_summary: string;
-  improvement_suggestions: string[];
-}
-
-const JUDGE_TOOL = {
-  type: "function" as const,
-  function: {
-    name: "submit_evaluation",
-    description: "Submit a structured evaluation of a competitive analysis response.",
-    parameters: {
-      type: "object",
-      properties: {
-        factual_correctness: {
-          type: "object",
-          properties: { score: { type: "number" }, reasoning: { type: "string" } },
-          required: ["score", "reasoning"], additionalProperties: false,
-        },
-        structural_clarity: {
-          type: "object",
-          properties: { score: { type: "number" }, reasoning: { type: "string" } },
-          required: ["score", "reasoning"], additionalProperties: false,
-        },
-        depth_of_comparison: {
-          type: "object",
-          properties: { score: { type: "number" }, reasoning: { type: "string" } },
-          required: ["score", "reasoning"], additionalProperties: false,
-        },
-        visual_evidence: {
-          type: "object",
-          properties: { score: { type: "number" }, reasoning: { type: "string" } },
-          required: ["score", "reasoning"], additionalProperties: false,
-        },
-        citation_coverage: {
-          type: "object",
-          properties: { score: { type: "number" }, reasoning: { type: "string" } },
-          required: ["score", "reasoning"], additionalProperties: false,
-        },
-        actionability: {
-          type: "object",
-          properties: { score: { type: "number" }, reasoning: { type: "string" } },
-          required: ["score", "reasoning"], additionalProperties: false,
-        },
-        media_quality: {
-          type: "object",
-          properties: { score: { type: "number" }, reasoning: { type: "string" } },
-          required: ["score", "reasoning"], additionalProperties: false,
-        },
-        overall_score: { type: "number" },
-        overall_summary: { type: "string" },
-        improvement_suggestions: { type: "array", items: { type: "string" } },
-      },
-      required: ["factual_correctness", "structural_clarity", "depth_of_comparison", "visual_evidence", "citation_coverage", "actionability", "media_quality", "overall_score", "overall_summary", "improvement_suggestions"],
-      additionalProperties: false,
-    }
-  }
-};
-
-async function evaluateResponse(content: string, competitor: string, subCategory: string): Promise<JudgeEvaluation | null> {
-  const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-  if (!LOVABLE_API_KEY) return null;
-
-  try {
-    const res = await monitoredFetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash-lite",
-        messages: [{
-          role: "user",
-          content: `You are an expert Competitive Intelligence Quality Judge. Evaluate this competitive analysis of "${competitor}" vs Workday Adaptive Planning in "${subCategory}".
-
-Score each criterion 1-10 with specific reasoning. Weighting: factual_correctness(22%) + depth_of_comparison(22%) + structural_clarity(13%) + actionability(13%) + citation_coverage(10%) + visual_evidence(10%) + media_quality(10%).
-
-RESPONSE TO EVALUATE:
-${content.slice(0, 12000)}`,
-        }],
-        tools: [JUDGE_TOOL],
-        tool_choice: { type: "function", function: { name: "submit_evaluation" } },
-      }),
-    });
-
-    if (!res.ok) return null;
-    const data = await res.json();
-    const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
-    if (toolCall?.function?.arguments) {
-      return JSON.parse(toolCall.function.arguments) as JudgeEvaluation;
-    }
-    const raw = data.choices?.[0]?.message?.content || "";
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (jsonMatch) return JSON.parse(jsonMatch[0]) as JudgeEvaluation;
-    return null;
-  } catch (e) {
-    console.error("Judge error:", e);
-    return null;
-  }
-}
-
-/** Fire-and-forget: persist newly approved crawl media to media_assets so future lookups find them */
-async function persistNewMediaToGallery(
-  competitor: string, category: string, subCategory: string, mediaLines: string[],
-): Promise<void> {
-  const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
-
-  const supaClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-  let inserted = 0;
-
-  for (const line of mediaLines) {
-    const urlMatch = line.match(/(https?:\/\/[^\s)]+)/);
-    if (!urlMatch) continue;
-    const url = urlMatch[1];
-
-    // Skip video URLs — only persist images/gifs
-    const isVideo = url.includes("youtube.com") || url.includes("youtu.be") || url.includes("vimeo.com") ||
-      url.includes("wistia.com") || url.includes("vidyard.com") || url.includes("loom.com") ||
-      /\.(?:mp4|webm|mov|ogg)(?:\?|$)/i.test(url);
-    if (isVideo) continue;
-
-    // Check if already in gallery
-    const normalizedUrl = url.replace(/\?.*$/, "");
-    const { count } = await supaClient
-      .from("media_assets")
-      .select("id", { count: "exact", head: true })
-      .or(`storage_url.eq.${url},cdn_url.eq.${url}`)
-      .eq("competitor_name", competitor)
-      .eq("is_active", true);
-
-    if ((count || 0) > 0) continue;
-
-    // Extract label for alt_text
-    const labelMatch = line.match(/\]\s*(.+?)(?:\s*\(|:\s*https?)/);
-    const altText = labelMatch ? labelMatch[1].trim().slice(0, 200) : `${competitor} ${subCategory}`;
-
-    const mediaType = /\.gif(?:\?|$)/i.test(url) ? "gif" : "image";
-
-    const { error } = await supaClient.from("media_assets").insert({
-      competitor_name: competitor,
-      product_area: category,
-      product_sub_area: subCategory,
-      storage_url: url,
-      cdn_url: url,
-      media_type: mediaType,
-      alt_text: altText,
-      source_type: "live-crawl",
-      page_url: url,
-      is_active: true,
-      metadata: { crawl_source: "chat-analysis-auto-persist", persisted_at: new Date().toISOString() },
-    });
-
-    if (!error) {
-      inserted++;
-    } else {
-      console.error(`Failed to persist media to gallery: ${error.message}`);
-    }
-  }
-
-  if (inserted > 0) {
-    console.log(`persistNewMediaToGallery: inserted ${inserted} new assets for "${competitor}" / "${subCategory}"`);
-  }
+  } catch { /* no-op */ }
 }
 
 Deno.serve(async (req) => {
@@ -1778,6 +70,7 @@ Deno.serve(async (req) => {
       Deno.env.get('SUPABASE_ANON_KEY')!,
       { global: { headers: { Authorization: authHeader } } }
     );
+    // CRITICAL_AWAIT_OK: fail-hard by design — see surrounding try/catch
     const { data: { user }, error: userErr } = await supabaseAuth.auth.getUser();
     if (userErr || !user) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } });
@@ -1788,9 +81,54 @@ Deno.serve(async (req) => {
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
     );
 
-    const { category, subCategory, competitor, competitors: competitorsList, message, threadId, history, isNewsSummary, newsContext } = await req.json();
-    // competitorsList is an array when multi-competitor, competitor is the joined label
-    const allCompetitors: string[] = Array.isArray(competitorsList) && competitorsList.length > 0 ? competitorsList : (competitor ? [competitor] : []);
+    // CRITICAL_AWAIT_OK: primary HTTP I/O on fail-hard path
+    const { category, subCategory, competitor, competitors: competitorsList, message, threadId, history, isNewsSummary, newsContext, feedScope, feedCompetitorFilter } = await req.json();
+
+    // Thread ownership: a caller may only write into a thread they own.
+    // Prevents cross-user trace/message injection via a supplied threadId.
+    if (threadId) {
+      const { data: ownedThread, error: threadErr } = await supabaseService
+        .from("chat_threads")
+        .select("user_id")
+        .eq("id", threadId)
+        .maybeSingle();
+      if (threadErr || !ownedThread || ownedThread.user_id !== user.id) {
+        return new Response(JSON.stringify({ error: "Forbidden" }), { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+    }
+
+    // Lightweight input validation: reject malformed types / abusive lengths.
+    const tooLong = (v: unknown, max: number) => typeof v === "string" && v.length > max;
+    if (
+      tooLong(message, 20000) || tooLong(category, 200) || tooLong(subCategory, 200) ||
+      tooLong(competitor, 300) || tooLong(newsContext, 200000) ||
+      (threadId !== undefined && threadId !== null && typeof threadId !== "string") ||
+      (competitorsList !== undefined && !Array.isArray(competitorsList)) ||
+      (history !== undefined && !Array.isArray(history))
+    ) {
+      return new Response(JSON.stringify({ error: "Invalid input" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+
+
+    let allCompetitors: string[] = Array.isArray(competitorsList) && competitorsList.length > 0 ? competitorsList : (competitor ? [competitor] : []);
+    const feedFilteredCompetitors: string[] = Array.isArray(feedCompetitorFilter) ? feedCompetitorFilter : [];
+
+    // --- General query competitor extraction (sheet-backed) ---
+    // When no competitor was selected, look up the message against the full
+    // 173-row XLSX knowledge base. Whole-word, longest-name-first matching.
+    if (allCompetitors.length === 0 && message && !isNewsSummary) {
+      try {
+        // CRITICAL_AWAIT_OK: fail-hard by design — see surrounding try/catch
+        const matched = await findProfilesInText(message);
+        if (matched.length > 0) {
+          allCompetitors = matched.map((p) => p.name);
+          console.log(`General query: matched sheet KB competitors: ${allCompetitors.join(", ")}`);
+        }
+      } catch (e) {
+        console.error("findProfilesInText failed:", e);
+      }
+    }
 
     // ===== NEWS SUMMARY MODE =====
     if (isNewsSummary && newsContext) {
@@ -1800,21 +138,241 @@ Deno.serve(async (req) => {
       }
 
       const agentSource = "feed_agent";
+      const scopedItemCount = (newsContext.match(/\[(\d+)\]/g) || []).length;
+      const normalizedMessage = String(message || "").toLowerCase();
+      const mentionsFeedEvidence = /\b(news|article|articles|community|post|posts|discussion|discussions|feed|sentiment|announcement|launch|reddit|linkedin|source|sources|press|coverage)\b/.test(normalizedMessage);
+      const asksForDeepProductAnalysis = /\b(deep\s*dive|full\s*product|swot|feature\s+(?:comparison|analysis)|capabilit(?:y|ies)|architecture|integration|workflow|modeling|forecasting|implementation|pricing|roadmap|compare\b.*\b(?:workday|pigment|anaplan|planful|oracle|sap|onestream|jedox|prophix|board|ibm)\b)\b/.test(normalizedMessage);
+      const knownCompetitors = ["anaplan", "planful", "pigment", "datarails", "jedox", "onestream", "prophix", "workiva", "oracle", "sap", "ibm", "board", "vena", "workday", "tagetik"];
+      const mentionsUnknownProduct = !knownCompetitors.some(c => normalizedMessage.includes(c));
+      const shouldRedirectToCompAgent = asksForDeepProductAnalysis && !mentionsFeedEvidence;
 
-      const newsSystemPrompt = `You are a Competitive Intelligence News Analyst specializing in FP&A and EPM software. You help users understand and analyze competitive news and community discussions.
+      // --- Auto-scrape URLs from user message ---
+      const feedMessageUrls = extractUrls(message || "");
+      let liveSearchResults = "";
+      if (feedMessageUrls.length > 0) {
+        // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+        const scrapedContent = await scrapeUserUrls(feedMessageUrls);
+        if (scrapedContent.length > 0) {
+          liveSearchResults = `\n\n--- DIRECT URL SCRAPE RESULTS ---\n${scrapedContent.join("\n\n")}\n--- END DIRECT SCRAPE ---`;
+          console.log(`Feed agent: auto-scraped ${scrapedContent.length} URLs from user message`);
+        }
+      }
+
+      // --- Intelligent live search decision ---
+      // Use a lightweight LLM to decide if a live search is needed
+      let searchDecision: { needsSearch: boolean; searchQueries: string[]; reason: string } = { needsSearch: false, searchQueries: [], reason: "default" };
+
+      if (!shouldRedirectToCompAgent) {
+        try {
+          const classificationPrompt = `You are a search-need classifier for a competitive intelligence feed agent focused on FP&A/EPM software. You also handle GENERAL COMPANY RESEARCH queries.
+
+Given the user's query, conversation history context, and the number of feed items available, decide if a LIVE WEB SEARCH is needed TO SUPPLEMENT the feed data. The feed data is ALWAYS provided to the agent — you are deciding whether ADDITIONAL live search is also needed.
+
+IMPORTANT: This is a HYBRID system. The agent always sees the feed items. Your job is to decide if the query ALSO requires real-time web intelligence beyond what a news/community feed would contain.
+
+SEARCH IS NEEDED when:
+- User asks about a competitor/product NOT well covered in the feed (especially unknown/niche products)
+- User asks for specific factual data (people, funding, revenue, headcount, LinkedIn profiles, etc.)
+- User asks about company leadership, executives, founders, or their backgrounds/social profiles
+- User asks about company financials, funding rounds, valuations, investors, IPO status
+- User asks about company size/segment, market positioning, employee/customer count
+- User asks about market size, TAM, industry analysis
+- User asks about acquisitions, partnerships, strategic moves
+- User asks about specific people by role (e.g. "VP of Product", "CRO", "Head of Engineering")
+- User asks for LinkedIn, Twitter, or other social media profiles
+- The feed has very few items (<3) for the topic in question
+- User asks for customer reviews, user experiences not likely in the feed
+
+SEARCH IS NOT NEEDED when:
+- User asks for a general summary of available news/feed items
+- User asks "what's new" or "latest updates" (just summarize existing feed)
+- User asks to analyze or group the existing feed items
+- User asks follow-up questions about previously discussed content that was already answered
+- User asks general/conversational questions (greetings, thanks, etc.)
+
+CRITICAL — SEARCH QUERY QUALITY:
+- Generate HIGHLY SPECIFIC search queries that will directly find the answer
+- For people searches: include the company name AND the role AND "LinkedIn" (e.g. "Datarails VP Product LinkedIn profile name")
+- For funding: include the company name AND "funding round" or "series" (e.g. "Datarails latest funding round 2024 2025")
+- For leadership: include name if known from conversation history (e.g. "Didi Gurfinkel LinkedIn" not just "Datarails CEO LinkedIn")
+- NEVER generate vague queries like "Datarails leadership" when the user asked for a specific role
+- Use conversation history to enrich queries (e.g. if CEO name was already discussed, use it)
+
+CONVERSATION HISTORY (last few messages for context):
+${(history || []).slice(-4).map((m: any) => `${m.role}: ${m.content?.slice(0, 200)}`).join("\n")}
+
+Respond in JSON only:
+{
+  "needs_search": true/false,
+  "search_queries": ["very specific query 1", "very specific query 2"],
+  "reason": "brief explanation"
+}
+
+USER QUERY: "${String(message || "").replace(/"/g, '\\"')}"
+AVAILABLE FEED ITEMS: ${scopedItemCount}
+FEED SCOPE: ${feedScope || "all competitors"}
+ACTIVE COMPETITOR FILTER: ${feedFilteredCompetitors.length > 0 ? feedFilteredCompetitors.join(", ") : "all competitors"}`;
+          // CRITICAL_AWAIT_OK: primary LLM generation — fail-hard by design
+          const classifyRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
+            body: JSON.stringify({
+              model: "openai/gpt-5.4-nano",
+              messages: [{ role: "user", content: classificationPrompt }],
+              max_completion_tokens: 300,
+            }),
+          });
+
+          if (classifyRes.ok) {
+            // CRITICAL_AWAIT_OK: primary HTTP I/O on fail-hard path
+            const classifyData = await classifyRes.json();
+            const rawText = classifyData.choices?.[0]?.message?.content || "";
+            const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              const parsed = JSON.parse(jsonMatch[0]);
+              searchDecision = {
+                needsSearch: !!parsed.needs_search,
+                searchQueries: Array.isArray(parsed.search_queries) ? parsed.search_queries.slice(0, 2) : [],
+                reason: parsed.reason || "",
+              };
+            }
+          }
+          console.log(`Feed search decision: needsSearch=${searchDecision.needsSearch}, reason="${searchDecision.reason}"`);
+        } catch (e) {
+          console.error("Search classification error:", e);
+        }
+      }
+
+      // Execute live searches if the classifier determined they're needed
+      // Two-step pipeline: 1) Claude web search discovers URLs, 2) Firecrawl extracts full content
+      if (searchDecision.needsSearch && searchDecision.searchQueries.length > 0) {
+        try {
+          const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY");
+          const searchResultItems: string[] = [];
+
+          for (const sq of searchDecision.searchQueries) {
+            try {
+              // Step 1: Use Claude web search (Anthropic API) to discover relevant URLs
+              let discoveredUrls: { title: string; url: string; snippet: string }[] = [];
+              if (ANTHROPIC_KEY) {
+                // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+                const searchResults = await claudeWebSearch(sq, 5);
+                for (const text of searchResults) {
+                  const urlMatch = text.match(/https?:\/\/[^\s)\]]+/);
+                  if (urlMatch?.[0]) {
+                    discoveredUrls.push({
+                      title: text.slice(0, 100),
+                      url: urlMatch[0],
+                      snippet: text.slice(0, 300),
+                    });
+                  }
+                }
+                console.log(`Claude search for "${sq.slice(0, 60)}": found ${discoveredUrls.length} URLs`);
+              }
+
+              // If Claude didn't find enough, use Firecrawl search as a discovery fallback
+              if (hasFirecrawlKey() && discoveredUrls.length < 3) {
+                try {
+                  // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+                  const fcSearchRes = await firecrawlFetch("https://api.firecrawl.dev/v1/search", {
+                    method: "POST",
+                    body: JSON.stringify({ query: sq, limit: 5, scrapeOptions: { formats: ["markdown"] } }),
+                  });
+                  if (fcSearchRes.ok) {
+                    // CRITICAL_AWAIT_OK: primary HTTP I/O on fail-hard path
+                    const fcSearchData = await fcSearchRes.json();
+                    for (const r of (fcSearchData.data || [])) {
+                      if (r.url && !discoveredUrls.some(d => d.url === r.url)) {
+                        discoveredUrls.push({
+                          title: r.title || r.metadata?.title || "",
+                          url: r.url,
+                          snippet: r.markdown?.slice(0, 300) || r.description || "",
+                        });
+                      }
+                    }
+                  }
+                } catch { /* firecrawl search fallback */ }
+              }
+
+              // Step 2: Use Firecrawl API to extract full content from discovered URLs
+              // Scrape top 3 URLs in parallel for speed
+              const urlsToScrape = discoveredUrls.slice(0, 3);
+              if (hasFirecrawlKey() && urlsToScrape.length > 0) {
+                const scrapePromises = urlsToScrape.map(async (item) => {
+                  try {
+                    // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+                    const scrapeRes = await firecrawlFetch("https://api.firecrawl.dev/v1/scrape", {
+                      method: "POST",
+                      body: JSON.stringify({
+                        url: item.url,
+                        formats: ["markdown"],
+                        onlyMainContent: true,
+                      }),
+                    });
+                    if (scrapeRes.ok) {
+                      // CRITICAL_AWAIT_OK: primary HTTP I/O on fail-hard path
+                      const scrapeData = await scrapeRes.json();
+                      const fullMarkdown = scrapeData.data?.markdown || scrapeData.markdown || "";
+                      if (fullMarkdown.length > 50) {
+                        item.snippet = fullMarkdown; // Use full extracted content
+                        console.log(`Firecrawl extracted ${fullMarkdown.length} chars from ${item.url}`);
+                      }
+                    }
+                  } catch (e) {
+                    console.error(`Firecrawl scrape failed for ${item.url}:`, e);
+                  }
+                });
+                await Promise.all(scrapePromises);
+              }
+
+              // Build final result items from all discovered URLs (enriched with Firecrawl content)
+              for (const item of discoveredUrls) {
+                searchResultItems.push(`- "${item.title}" (${item.url})\n  ${item.snippet}`);
+              }
+            } catch { /* ignore search error */ }
+          }
+
+          if (searchResultItems.length > 0) {
+            liveSearchResults = `\n\n--- LIVE SEARCH RESULTS (real-time web intelligence) ---\nThe following items were found via live web search and content extraction to supplement the feed data:\n\n${searchResultItems.join("\n\n")}\n--- END LIVE SEARCH ---`;
+          }
+        } catch (e) {
+          console.error("Feed agent live search error:", e);
+        }
+      }
+
+      const newsSystemPrompt = `You are a Competitive Intelligence News Analyst and General Research Assistant specializing in FP&A and EPM software. You help users understand and analyze competitive news, community discussions, AND perform general company research.
+
+You operate in a HYBRID mode with TWO data sources that are ALWAYS combined:
+1. SCOPED FEED ITEMS — pre-filtered news and community items from the feed database (always available)
+2. LIVE SEARCH RESULTS (when available) — real-time web search results that supplement the feed data
 
 CRITICAL RULES:
-1. You HAVE full access to all the news and community items listed below. These were fetched and curated by our intelligence system.
+1. ALWAYS synthesize BOTH feed items AND live search results into a unified, comprehensive answer. Never treat them as separate — weave insights from both sources together naturally.
 2. NEVER say phrases like "I don't have access to", "I cannot verify", "I'm unable to retrieve", "I don't have real-time access", "I cannot browse", or similar disclaimers. You have the data right here.
-3. If asked about something not covered in the data below, say "Based on the current feed, there are no items matching that criteria" — NOT "I don't have access."
-4. Never expose internal adaptive planning data or proprietary information.
-5. Always respond as if you are fully informed — because you are. The data below IS your knowledge base for this conversation.
+3. NEVER punt to the user. Do NOT say things like "If you tell me the name...", "You can search LinkedIn for...", "Try searching for...", "I recommend checking...". YOU are the researcher — present what you found definitively. If you have partial information, present it confidently and offer to dig deeper, but never ask the user to do research themselves.
+4. If asked about a competitor or product NOT in the feed scope, use the live search results to provide whatever intelligence you found. Present the findings proactively.
+5. If the user asks for a deeper product or competitor analysis beyond news/community evidence, politely redirect them to Comp Agent.
+6. Never expose internal adaptive planning data or proprietary information.
+7. When live search results are available, EXTRACT specific facts (names, titles, URLs, numbers) from the raw content — don't just summarize that results were found.
+8. For community sentiment questions, focus on actual user opinions, complaints, praise, and experiences from the data.
+9. For people/LinkedIn queries: Extract the ACTUAL person's name and profile URL from search results. If the search results contain a LinkedIn URL, present it as a direct link. If results mention a person's name for the role, state it definitively.
 
-Here are ALL the news/community items currently visible to the user:
+GENERAL RESEARCH CAPABILITY:
+- You can answer questions about company leadership (CEO, CTO, founders, VP, directors), their LinkedIn profiles, and backgrounds
+- You can research funding rounds, revenue estimates, valuations, and investor information
+- You can determine company size/segment (mid-market, enterprise, SMB, employee count)
+- You can research market size, TAM, and industry positioning
+- You can find information about acquisitions, partnerships, and strategic moves
+- For these general research queries, EXTRACT AND PRESENT specific facts from LIVE SEARCH RESULTS with source citations
 
---- NEWS ITEMS DATA (${(newsContext.match(/\[(\d+)\]/g) || []).length} items) ---
+CURRENT FILTER SCOPE:
+${feedScope || "Use only the provided filtered feed items."}
+${feedFilteredCompetitors.length > 0 ? `\nFEED DATA IS FILTERED TO: ${feedFilteredCompetitors.join(", ")}. The feed items below are scoped to these competitors. However, ALWAYS prioritize answering the user's actual question. If the user asks about a different competitor than what the feed is filtered to, use live search results to answer about that competitor — do NOT force-inject the filtered competitors into the response.\n` : ""}
+
+--- FEED DATA (${scopedItemCount} items) ---
 ${newsContext}
---- END DATA ---
+--- END FEED DATA ---
+${liveSearchResults}
 
 FORMATTING RULES:
 - Use ## for section headers
@@ -1823,8 +381,8 @@ FORMATTING RULES:
 - Focus on competitive implications and strategic insights
 - Reference specific articles/sources by their title and source name
 - When summarizing, group by competitor/vendor for clarity
-- IMPORTANT: Always embed hyperlinks to source articles using markdown link syntax [Article Title](URL). Every time you reference an article, link to it. This is critical for user experience.
-- Example: "According to [Anaplan Launches New AI Features](https://example.com/article), the platform now supports..."
+- IMPORTANT: Always embed hyperlinks to source articles using markdown link syntax [Article Title](URL). Every time you reference an article, link to it.
+- For LinkedIn profiles: Always present as a clickable markdown link [Person Name](linkedin-url)
 - Never show raw URLs without markdown link formatting`;
 
       const sanitizedNewsHistory = (history || []).filter(
@@ -1845,10 +403,21 @@ FORMATTING RULES:
           const keepalive = setInterval(() => sendEvent("ping", { ts: Date.now() }), 15000);
 
           try {
+            if (shouldRedirectToCompAgent && !mentionsUnknownProduct) {
+              sendEvent("content", {
+                content: "## Better handled by Comp Agent\n- I can analyze only the news and community items in the current filtered feed scope.\n- This request sounds like a deeper product or competitor analysis, so Comp Agent will give you a stronger answer.\n- If you want, I can still summarize the feed signals for that competitor within the current scope.",
+              });
+              sendEvent("done", {});
+              return;
+            }
+
+            const newsLlmStartTime = Date.now();
+            let newsUsage: any = {};
+            // CRITICAL_AWAIT_OK: primary LLM generation — fail-hard by design
             const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
               method: "POST",
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
-              body: JSON.stringify({ model: "google/gemini-2.5-flash", messages: aiMessages, stream: true }),
+              body: JSON.stringify({ model: "openai/gpt-5.5", messages: aiMessages, stream: true }),
             });
 
             if (!response.ok) {
@@ -1865,6 +434,7 @@ FORMATTING RULES:
 
             if (reader) {
               while (true) {
+                // CRITICAL_AWAIT_OK: SSE stream loop — fail-hard by design
                 const { done, value } = await reader.read();
                 if (done) break;
                 streamBuffer += decoder.decode(value, { stream: true });
@@ -1880,12 +450,12 @@ FORMATTING RULES:
                     const parsed = JSON.parse(jsonStr);
                     const delta = parsed.choices?.[0]?.delta?.content;
                     if (delta) { fullContent += delta; sendEvent("token", { token: delta }); }
+                    if (parsed.usage) { newsUsage = parsed.usage; }
                   } catch { streamBuffer = line + "\n" + streamBuffer; break; }
                 }
               }
             }
 
-            // Sanitize system-like disclaimers from the response
             const disclaimerPatterns = [
               /I don['']t have (?:access|real-time access) to[^.]*\./gi,
               /I(?:'m| am) unable to (?:access|retrieve|browse|verify)[^.]*\./gi,
@@ -1899,59 +469,53 @@ FORMATTING RULES:
             }
             sanitizedContent = sanitizedContent.replace(/\n{3,}/g, "\n\n").trim();
 
-            sendEvent("content", { content: sanitizedContent });
-
-            let traceId: string | null = null;
-            try {
-              const { data: traceData } = await supabaseService.from("agent_traces").insert({
-                user_id: user.id, category: category || "News Summary", sub_category: subCategory || "News",
-                thread_id: threadId || null,
-                user_prompt: message, raw_llm_output: sanitizedContent, formatted_output: sanitizedContent,
-                model_used: "google/gemini-2.5-flash", status: "completed",
-                trace_type: "conversation", agent_source: agentSource,
-                metadata: {
-                  slide_summary_status: "pending",
-                  slide_summary_model: "openai/gpt-5-nano",
-                },
-              }).select("id").single();
-              traceId = traceData?.id || null;
-            } catch (e) { console.error("News trace error:", e); }
-
-            if (traceId) {
-              // Build slide summaries INLINE before sending done — must complete before function exits
-              try {
-                const slideSummary = await buildSlideSummaryPayload(
-                  sanitizedContent,
-                  `${category || "News Summary"} ${subCategory || "News"}`.trim(),
-                  LOVABLE_API_KEY,
-                );
-                const slideMetadata = slideSummary
-                  ? {
-                      slide_summary_status: "ready",
-                      slide_summary_model: slideSummary.model,
-                      slide_summary_version: slideSummary.version,
-                      slide_summary_generated_at: slideSummary.generated_at,
-                      slide_section_summaries: slideSummary.sections,
-                      slide_summary_lookup: slideSummary.lookup,
-                    }
-                  : {
-                      slide_summary_status: "failed",
-                      slide_summary_model: "openai/gpt-5-nano",
-                    };
-
-                await supabaseService
-                  .from("agent_traces")
-                  .update({ metadata: slideMetadata })
-                  .eq("id", traceId)
-                  .eq("user_id", user.id);
-              } catch (summaryErr) {
-                console.error("News slide summary error:", summaryErr);
-              }
-
-              sendEvent("metadata", { traceId });
-            }
-
+            const messageId = crypto.randomUUID();
+            const traceId = crypto.randomUUID();
+            sendEvent("content", { content: sanitizedContent, messageId });
+            sendEvent("metadata", { traceId });
             sendEvent("done", {});
+
+            // All persistence off the user's critical path.
+            const newsLatencyMs = Date.now() - newsLlmStartTime;
+            queueBackgroundTask((async () => {
+              try {
+                await supabaseService.from("chat_messages").insert({
+                  id: messageId,
+                  thread_id: threadId,
+                  user_id: user.id,
+                  role: "assistant",
+                  content: sanitizedContent,
+                  metadata: { trace_id: traceId },
+                });
+              } catch (e) { console.error("News chat_messages insert error:", e); }
+
+              try {
+                await supabaseService.from("agent_traces").insert({
+                  id: traceId,
+                  message_id: messageId,
+                  user_id: user.id, category: category || "News Summary", sub_category: subCategory || "News",
+                  thread_id: threadId || null, competitor_name: null,
+                  user_prompt: message, system_prompt: newsSystemPrompt,
+                  raw_llm_output: sanitizedContent, formatted_output: sanitizedContent,
+                  model_used: "openai/gpt-5.5", status: "completed",
+                  trace_type: "conversation", agent_source: agentSource,
+                  latency_ms: newsLatencyMs,
+                  prompt_tokens: newsUsage.prompt_tokens || null,
+                  completion_tokens: newsUsage.completion_tokens || null,
+                  total_tokens: newsUsage.total_tokens || null,
+                  retrieved_documents: [], tool_calls: [],
+                  metadata: { slide_summary_status: "pending", slide_summary_model: SLIDE_SUMMARY_MODEL },
+                });
+              } catch (e) { console.error("News trace error:", e); }
+
+              try {
+                const slideSummary = await buildSlideSummaryPayload(sanitizedContent, `${category || "News Summary"} ${subCategory || "News"}`.trim(), LOVABLE_API_KEY);
+                const slideMetadata = slideSummary
+                  ? { slide_summary_status: "ready", slide_summary_model: slideSummary.model, slide_summary_version: slideSummary.version, slide_summary_generated_at: slideSummary.generated_at, slide_section_summaries: slideSummary.sections, slide_summary_lookup: slideSummary.lookup, slide_summary_diagnostics: slideSummary.diagnostics, slide_summary_error: null }
+                  : { slide_summary_status: "failed", slide_summary_model: SLIDE_SUMMARY_MODEL, slide_summary_error: "no_sections_parsed" };
+                await supabaseService.from("agent_traces").update({ metadata: slideMetadata }).eq("id", traceId).eq("user_id", user.id);
+              } catch (summaryErr) { console.error("News slide summary error:", summaryErr); }
+            })());
           } catch (e) {
             console.error("News summary error:", e);
             sendEvent("error", { content: "Failed to generate summary." });
@@ -1965,51 +529,203 @@ FORMATTING RULES:
       return new Response(newsStream, { headers: sseHeaders });
     }
 
+    // ===== COMPETITIVE ANALYSIS MODE =====
     const encoder = new TextEncoder();
+    // SSE CONTRACT — operations between the last token emitted and controller.close():
+    //   (a) operations that change VISIBLE content, with a hard time budget < 10s
+    //       (e.g. response-contract repair), or
+    //   (b) milliseconds of housekeeping (id generation, sendEvent calls).
+    // Anything else (LLM judge, slide summary, persistence) goes through
+    // queueBackgroundTask and runs AFTER the stream closes. Operational
+    // persistence — eval scores, trace metadata, judge scores — is ALWAYS written
+    // server-side here, NEVER from the client.
     const stream = new ReadableStream({
       async start(controller) {
         const sendEvent = (event: string, data: any) => {
-          try {
-            controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-          } catch { /* stream closed */ }
+          try { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); } catch {}
         };
-
-        const keepalive = setInterval(() => {
-          sendEvent("ping", { ts: Date.now() });
-        }, 15000);
+        const keepalive = setInterval(() => sendEvent("ping", { ts: Date.now() }), 15000);
 
         try {
+          console.error("[chat-analysis:boot] version=2026-05-01T15:15Z flat-shared");
+
+          // Hoisted so the outer catch can serialize whatever stages completed
+          // before the crash. Pre-stream stages push directly into this array
+          // (see [stage:enter]/[stage:exit] markers below).
+          const stageDiagnostics: StageDiagnostics[] = [];
+          let lastEnteredStage: string | null = null;
+          const enterStage = (name: string) => {
+            lastEnteredStage = name;
+            console.error(`[stage:enter] ${name}`);
+          };
+          const exitStage = (name: string, ms?: number) => {
+            stageDiagnostics.push({ name, status: "ok", ms: ms ?? 0 });
+            console.error(`[stage:exit] ${name}${ms !== undefined ? ` (${ms}ms)` : ""}`);
+          };
+
+
           sendEvent("progress", { step: "Starting analysis..." });
+
+          // Intent-based classification using GPT-5 Nano
+          sendEvent("progress", { step: "Classifying query intent..." });
+          // CRITICAL_AWAIT_OK: intent classification on fail-hard path
+          const intentResult = await classifyIntent(message, history, {
+            competitor: allCompetitors[0] || competitor,
+            category, subCategory,
+            agent: "comp",
+          });
+          const doResearch = intentResult.needsResearch;
+          const doGeneralResearch = intentResult.needsGeneralResearch;
+
+          // Classify query intent (narrow vs broad, entities, asksMedia, asksCommunity)
+          // BEFORE media lookup so off-topic gallery items are filtered at the source —
+          // not just at the post-hoc response-contract gate. Privacy: only the user
+          // prompt is sent to the classifier; no Adaptive Planning content is forwarded.
+          // CRITICAL_AWAIT_OK: intent classification on fail-hard path
+          const queryIntent = await classifyQueryIntent(message).catch((err) => {
+            console.warn("classifyQueryIntent failed; falling back to broad scope:", err);
+            return {
+              scope: "broad" as const, entities: [], asksCommunity: false, asksMedia: false,
+              asksComparison: false, competitors: [], depthExpected: "medium" as const, type: "other" as const,
+            };
+          });
+          console.log(`Query intent: scope=${queryIntent.scope} entities=[${queryIntent.entities.join(", ")}] asksMedia=${queryIntent.asksMedia} asksCommunity=${queryIntent.asksCommunity}`);
+
+          // ===== FP&A SCOPE GUARDRAIL =====
+          // If no competitor in the sheet KB matched AND the user picked the generic
+          // "General/General" charter (i.e. they did NOT pick a real charter/product
+          // area), treat the query as potentially off-topic. We only proceed with
+          // research if the topic is plausibly finance/planning related; otherwise
+          // we politely redirect without spending Claude/Firecrawl credits.
+          const FPA_SCOPE_RE = /\b(fp&?a|epm|cpm|financial planning|workforce planning|workforce|finance|cfo|controller|treasur|consolidat|close|forecast|forecasting|budget|budgeting|plan(?:ning)?|model(?:ing|ling)?|allocation|driver[- ]based|scenario|variance|reporting|account|accounting|erp|hris|adaptive|anaplan|pigment|onestream|planful|vena|sap|oracle|workday|gartner|peer|competitor|saas|enterprise|midmarket|mid[- ]market|smb|tagetik|jedox|datarails|prophix|workiva|ibm|tm1|board)\b/i;
+          const isGenericCharter = (category === "General" || !category) && (subCategory === "General" || !subCategory);
+          const looksOnTopic = FPA_SCOPE_RE.test(message || "") || allCompetitors.length > 0;
+          if (isGenericCharter && allCompetitors.length === 0 && !looksOnTopic && (message || "").trim()) {
+            const refusal = `I focus on competitive intelligence for **financial planning, workforce planning, FP&A, and EPM** — including the vendors tracked in our knowledge base.\n\nThe topic you asked about doesn't appear to fall in that scope, so I'm holding off on a full research run. Try asking about:\n- A specific FP&A/EPM vendor (e.g. Anaplan, Pigment, Aleph, Campfire, OneStream)\n- A planning capability (forecasting, consolidation, workforce planning, modeling, allocations, driver-based planning)\n- A vs-Workday Adaptive Planning comparison`;
+            sendEvent("content", { content: refusal });
+            sendEvent("done", { content: refusal });
+            clearInterval(keepalive);
+            controller.close();
+            return;
+          }
 
           let webIntel = "";
           let mediaContext = "";
+          // Lifted to outer scope so trace insert can reference them even when
+          // doResearch is false or when the research branch never executed.
+          let galleryResultsOuter: GalleryMediaResult[] = [];
+          let liveCrawlMetadataOuter: LiveCrawlMetadata[] = [];
+          // Media pipeline runs in PARALLEL with synthesis (decoupled channel).
+          // `mediaHandle` is created at the top of the research branch so the
+          // gallery lookup starts immediately. The FAST phase (gallery + YouTube)
+          // is streamed over the `media` SSE channel during research, so the live
+          // gallery is already populated before the prose finishes. The SLOW phase
+          // (`fullMediaPromise`: live crawls + quality gate) is NOT awaited on the
+          // critical path — it, the <<NEEDS_MEDIA>> on-demand gather, and the
+          // canonical "## Visual Overview" reconstruction all run in the BACKGROUND
+          // task after stream close, and are embedded into the PERSISTED content
+          // (the single source a reload re-renders from). This keeps media
+          // finalization off the prose-done signal so a large gallery quality gate
+          // can never stall the user's stream.
+          let mediaHandle: MediaGatherHandle | null = null;
+          let fullMediaPromise: Promise<MediaFullResult> | null = null;
+          let mediaItemsForClient: MediaItemPayload[] = [];
 
-          // ===== OPTIMIZATION B + D: Try cache first, skip LLM router =====
-          const doResearch = needsResearch(message, history);
+          // --- FEED EVIDENCE INJECTION ---
+          // Pull recent news + (intent-gated) community items from the curated
+          // `news_items` table for the resolved competitors, so Comp Agent can
+          // answer "what's the latest" / "what are users saying" without firing
+          // fresh Firecrawl calls. Items are deep-URL ready for citation.
+          let feedEvidence: FeedEvidence = {
+            newsBlock: "", communityBlock: "", newsItems: [], communityItems: [], urls: [],
+          };
+          if (allCompetitors.length > 0) {
+            const feedStage = await safeStage(
+              'feed_evidence',
+              async () => fetchFeedEvidenceForCompetitors(supabaseService, allCompetitors, {
+                // Always pull community signals so the Comp Agent can surface a
+                // mandatory "## Community Sentiment" section whenever items exist
+                // for the resolved competitor(s) — not just on Full Product or
+                // explicit sentiment queries. Availability (communityItems.length)
+                // is what gates the mandate downstream (prompt + contract).
+                includeCommunity: true,
+              }),
+              { newsBlock: "", communityBlock: "", newsItems: [], communityItems: [], urls: [] } as FeedEvidence,
+              { timeoutMs: 20_000 },
+            );
+            stageDiagnostics.push(feedStage.diagnostics);
+            feedEvidence = feedStage.value;
+            if (feedEvidence.newsBlock) webIntel = feedEvidence.newsBlock;
+            if (feedEvidence.communityBlock) {
+              webIntel = webIntel ? webIntel + "\n\n" + feedEvidence.communityBlock : feedEvidence.communityBlock;
+            }
+            console.log(`Feed evidence: ${feedEvidence.newsItems.length} news + ${feedEvidence.communityItems.length} community items injected${feedStage.degraded ? " [degraded]" : ""}`);
+          }
 
-          if (doResearch) {
+          // --- URL auto-scraping: scrape any URLs the user provided ---
+          if (intentResult.urlsToScrape.length > 0) {
+            sendEvent("progress", { step: "Scraping URLs from your message..." });
+            // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+            const scrapedContent = await scrapeUserUrls(intentResult.urlsToScrape);
+            if (scrapedContent.length > 0) {
+              webIntel = scrapedContent.join("\n\n");
+              console.log(`Auto-scraped ${scrapedContent.length} URLs from user message`);
+            }
+          }
+
+          // --- Subpage discovery for unknown companies ---
+          if (allCompetitors.length === 0 && intentResult.urlsToScrape.length > 0) {
+            // Extract domain from scraped URLs for deep discovery
+            for (const scrapedUrl of intentResult.urlsToScrape) {
+              try {
+                const urlObj = new URL(scrapedUrl);
+                const domain = urlObj.hostname;
+                sendEvent("progress", { step: `Discovering all pages on ${domain}...` });
+                // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+                const subpageContent = await discoverAndScrapeSubpages(domain);
+                if (subpageContent.length > 0) {
+                  sendEvent("progress", { step: `Scraped ${subpageContent.length} subpages and external references...` });
+                  webIntel = webIntel
+                    ? webIntel + "\n\n" + subpageContent.join("\n\n")
+                    : subpageContent.join("\n\n");
+                  console.log(`Subpage discovery added ${subpageContent.length} content pieces for ${domain}`);
+                }
+              } catch (e) {
+                console.error(`Domain extraction failed for ${scrapedUrl}:`, e);
+              }
+            }
+          }
+
+          if (doResearch && allCompetitors.length > 0) {
+            const competitorIntelStarted = Date.now();
+            enterStage('competitor_intel');
             sendEvent("progress", { step: `Retrieving intelligence for ${allCompetitors.join(", ")}...` });
+            try {
 
-            const isFullProduct = category === "Full Product" && subCategory === "Full Product";
+            // ── Media pipeline: launched in PARALLEL with intelligence
+            // gathering. The fast phase (gallery DB lookup + YouTube) starts
+            // immediately and does not depend on intel; the slow phase (live
+            // crawls + AI quality gate) is kicked below WITHOUT awaiting so it
+            // overlaps LLM generation and streams in via `media` SSE events.
+            enterStage('media_gather');
+            mediaHandle = startMediaGather({
+              competitors: allCompetitors,
+              category, subCategory,
+              queryIntent: { scope: queryIntent.scope, entities: queryIntent.entities, asksMedia: queryIntent.asksMedia },
+              onProgress: (step) => sendEvent("progress", { step }),
+            });
 
-            // ===== STEP 0: Gallery-first media lookup =====
-            // Check media_assets for existing media BEFORE any crawl
-            sendEvent("progress", { step: "Checking media gallery for existing assets..." });
-            const galleryResults = await Promise.all(
-              allCompetitors.map(comp => getGalleryMedia(comp, category, subCategory))
-            );
-
-            // Gather intelligence for ALL competitors in parallel
-            const allCachedResults = await Promise.all(
-              allCompetitors.map(comp => getCachedIntelligence(comp, subCategory, category))
-            );
+            // ── Intelligence gathering. The synthesizer depends on this, so it
+            // IS awaited before the LLM. Media bundled with cached/live intel is
+            // threaded into the media pipeline's slow phase (for quality-gating)
+            // rather than recomputed.
+            const allCachedResults = await Promise.all(allCompetitors.map(comp => getCachedIntelligence(comp, subCategory, category)));
 
             const allIntelParts: string[] = [];
-            const allMediaParts: string[] = [];
+            const bundledMediaParts: string[] = [];
             let anyHasCache = false;
             let anyMissingCache = false;
 
-            // For multi-competitor queries, truncate intelligence to avoid oversized prompts
             const maxIntelPerComp = allCompetitors.length > 2 ? 1200 : allCompetitors.length > 1 ? 1800 : 3000;
 
             for (let ci = 0; ci < allCompetitors.length; ci++) {
@@ -2017,15 +733,12 @@ FORMATTING RULES:
               const comp = allCompetitors[ci];
               if (cached.hasCachedData) {
                 anyHasCache = true;
-                // Truncate each intelligence block for multi-competitor queries to prevent timeout
                 const truncatedIntel = cached.intelligence.length > maxIntelPerComp
                   ? cached.intelligence.slice(0, maxIntelPerComp) + "\n[... truncated for prompt size]"
                   : cached.intelligence;
                 allIntelParts.push(`\n=== INTELLIGENCE: ${comp} ===\n${truncatedIntel}`);
-                // For gallery-only competitors, skip non-gallery cached media entirely
-                // (it's just cached screenshots from docs that haven't been quality-checked)
                 if (cached.media && !isGalleryOnlyCompetitor(comp)) {
-                  allMediaParts.push(cached.media.replace(/--- AVAILABLE OFFICIAL MEDIA ---/g, `--- ${comp.toUpperCase()} MEDIA ---`).replace(/--- END MEDIA ---/g, `--- END ${comp.toUpperCase()} MEDIA ---`));
+                  bundledMediaParts.push(cached.media.replace(/--- AVAILABLE OFFICIAL MEDIA ---/g, `--- ${comp.toUpperCase()} MEDIA ---`).replace(/--- END MEDIA ---/g, `--- END ${comp.toUpperCase()} MEDIA ---`));
                 } else if (cached.media && isGalleryOnlyCompetitor(comp)) {
                   console.log(`Skipping non-gallery cached media for gallery-only competitor "${comp}"`);
                 }
@@ -2034,261 +747,144 @@ FORMATTING RULES:
               }
             }
 
-            // ===== STEP 1: Add gallery media + YouTube videos to context =====
-            const allGalleryMediaLines: string[] = [];
-            const allGalleryUrls = new Set<string>();
-            for (let ci = 0; ci < allCompetitors.length; ci++) {
-              const gallery = galleryResults[ci];
-              for (const line of gallery.galleryMedia) allGalleryMediaLines.push(line);
-              for (const url of gallery.galleryUrls) allGalleryUrls.add(url);
-            }
-
-            // Always search YouTube for ALL competitors (including gallery-only)
-            sendEvent("progress", { step: "Searching YouTube for product videos..." });
-            const youtubeResults = await Promise.all(
-              allCompetitors.map(comp => searchYouTubeVideos(comp, category, subCategory))
-            );
-            const allYouTubeRefs: string[] = [];
-            for (const refs of youtubeResults) {
-              allYouTubeRefs.push(...refs);
-            }
-            if (allYouTubeRefs.length > 0) {
-              allMediaParts.push(`--- YOUTUBE VIDEOS ---\n${allYouTubeRefs.join("\n")}\n--- END YOUTUBE VIDEOS ---`);
-              console.log(`YouTube search: ${allYouTubeRefs.length} videos found across ${allCompetitors.length} competitors`);
-            } else {
-              console.log("YouTube search: no videos found for any competitor");
-            }
-
-            if (allGalleryMediaLines.length > 0) {
-              allMediaParts.unshift(`--- GALLERY MEDIA (pre-verified) ---\n${allGalleryMediaLines.join("\n")}\n--- END GALLERY MEDIA ---`);
-              toolCallsLog.push({ tool: "getGalleryMedia", totalGalleryAssets: allGalleryMediaLines.length });
-              console.log(`Gallery media: ${allGalleryMediaLines.length} pre-verified assets added`);
-            }
-
-            // ===== STEP 2: Decide whether to crawl for new media =====
-            const shouldCrawlMedia = await (async () => {
-              const crawlDecisions: { comp: string; shouldCrawl: boolean; reason: string }[] = [];
-
-              for (let ci = 0; ci < allCompetitors.length; ci++) {
-                const comp = allCompetitors[ci];
-                const gallery = galleryResults[ci];
-
-                // Gallery-only competitors (OneStream, Anaplan, Planful, Oracle, SAP, Pigment):
-                // Skip live crawl entirely — media is pre-crawled by daily scheduled-media-refresh
-                if (isGalleryOnlyCompetitor(comp)) {
-                  crawlDecisions.push({ comp, shouldCrawl: false, reason: `gallery-only competitor (${gallery.count} gallery assets)` });
-                  continue;
-                }
-
-                if (isFullProduct) {
-                  // Full Product threshold logic
-                  const threshold = await handleFullProductMediaThreshold(comp, gallery);
-                  if (threshold.skipCrawl) {
-                    crawlDecisions.push({ comp, shouldCrawl: false, reason: `>8 gallery assets (${gallery.count})` });
-                  } else {
-                    crawlDecisions.push({ comp, shouldCrawl: true, reason: `${gallery.count} gallery assets, ${threshold.missingSubAreas.length} missing areas` });
-                  }
-                } else {
-                  // Specific product area: crawl only if no gallery media exists for this intersection
-                  if (gallery.count === 0) {
-                    crawlDecisions.push({ comp, shouldCrawl: true, reason: "no gallery media for this product area" });
-                  } else {
-                    crawlDecisions.push({ comp, shouldCrawl: true, reason: `${gallery.count} gallery assets exist, checking for new non-CDN media` });
-                  }
-                }
-              }
-
-              for (const d of crawlDecisions) {
-                console.log(`Crawl decision for "${d.comp}": ${d.shouldCrawl ? "CRAWL" : "SKIP"} — ${d.reason}`);
-              }
-              return crawlDecisions;
-            })();
-
-            // ===== STEP 3: Gather intelligence + selective media crawling =====
             if (anyHasCache && !anyMissingCache) {
-              webIntel = allIntelParts.join("\n\n");
-              mediaContext = allMediaParts.join("\n\n");
+              const cachedIntel = allIntelParts.join("\n\n");
+              webIntel = webIntel ? webIntel + "\n\n" + cachedIntel : cachedIntel;
               toolCallsLog.push({ tool: "getCachedIntelligence", cached: true, competitors: allCompetitors.length });
-
-              // Only crawl for competitors that need it
-              const competitorsNeedingCrawl = shouldCrawlMedia.filter(d => d.shouldCrawl).map(d => d.comp);
-              if (competitorsNeedingCrawl.length > 0) {
-                sendEvent("progress", { step: `Crawling for ${subCategory} visuals (${competitorsNeedingCrawl.length} competitors)...` });
-                const crawlResults = await Promise.all(
-                  competitorsNeedingCrawl.map(comp => crawlForRelevantMedia(comp, category, subCategory))
-                );
-                for (const liveCrawl of crawlResults) {
-                  if (liveCrawl.mediaRefs.length > 0) {
-                    // Filter out URLs already in gallery to avoid duplicates
-                    const newMediaRefs = liveCrawl.mediaRefs.filter(ref => {
-                      const urlMatch = ref.match(/(https?:\/\/[^\s)]+)/);
-                      if (!urlMatch) return true;
-                      const normalizedUrl = urlMatch[1].replace(/\?.*$/, "");
-                      return !allGalleryUrls.has(normalizedUrl);
-                    });
-                    if (newMediaRefs.length > 0) {
-                      mediaContext += `\n--- LIVE CRAWL MEDIA (new) ---\n${newMediaRefs.join("\n")}\n--- END LIVE CRAWL MEDIA ---`;
-                      console.log(`Live crawl found ${newMediaRefs.length} NEW media (${liveCrawl.mediaRefs.length - newMediaRefs.length} duplicates skipped)`);
-                    }
-                  }
-                }
-              } else {
-                console.log("All competitors have sufficient gallery media — skipping live crawl");
-              }
-
-              sendEvent("progress", { step: "Intelligence loaded. Generating analysis..." });
             } else {
               sendEvent("progress", { step: "Gathering live competitive intelligence..." });
-              const competitorsNeedingCrawl = shouldCrawlMedia.filter(d => d.shouldCrawl).map(d => d.comp);
-
               const liveResults = await Promise.all(
-                allCompetitors.map(async (comp) => {
-                  const needsCrawl = competitorsNeedingCrawl.includes(comp);
-                  const [live, liveCrawl] = await Promise.all([
-                    gatherLiveIntelligenceAndMedia(comp, subCategory, category),
-                    needsCrawl ? crawlForRelevantMedia(comp, category, subCategory) : Promise.resolve({ mediaRefs: [], newPages: [] }),
-                  ]);
-                  return { comp, live, liveCrawl };
-                })
+                allCompetitors.map(async (comp) => ({ comp, live: await gatherLiveIntelligenceAndMedia(comp, subCategory, category) })),
               );
-
-              for (const { comp, live, liveCrawl } of liveResults) {
+              for (const { comp, live } of liveResults) {
                 if (live.intelligence) allIntelParts.push(`\n=== INTELLIGENCE: ${comp} ===\n${live.intelligence}`);
-                if (live.media) allMediaParts.push(live.media);
-                if (liveCrawl.mediaRefs.length > 0) {
-                  // Filter out gallery duplicates
-                  const newMediaRefs = liveCrawl.mediaRefs.filter(ref => {
-                    const urlMatch = ref.match(/(https?:\/\/[^\s)]+)/);
-                    if (!urlMatch) return true;
-                    return !allGalleryUrls.has(urlMatch[1].replace(/\?.*$/, ""));
-                  });
-                  if (newMediaRefs.length > 0) {
-                    allMediaParts.push(`--- LIVE CRAWL MEDIA (new) ---\n${newMediaRefs.join("\n")}\n--- END LIVE CRAWL MEDIA ---`);
-                  }
-                }
+                if (live.media) bundledMediaParts.push(live.media);
               }
-
-              webIntel = allIntelParts.join("\n\n");
-              mediaContext = allMediaParts.join("\n\n");
+              const liveIntel = allIntelParts.join("\n\n");
+              webIntel = webIntel ? webIntel + "\n\n" + liveIntel : liveIntel;
               toolCallsLog.push({ tool: "gatherLiveIntelligenceAndMedia", cached: false, competitors: allCompetitors.length });
-              sendEvent("progress", { step: "Intelligence gathered. Generating analysis..." });
             }
 
             if (webIntel) retrievedDocs.push({ source: "intel", length: webIntel.length });
 
-            // ===== MEDIA QUALITY AGENT: AI-powered filtering =====
-            // Gallery media is pre-verified (already passed quality gate), so only run quality agent
-            // on NON-gallery media items. Gallery items pass through automatically.
-            if (mediaContext) {
-              sendEvent("progress", { step: "AI media quality agent evaluating visuals..." });
-              try {
-                // Split media context into gallery (pre-verified) and non-gallery (needs evaluation)
-                const mediaLines = mediaContext.split("\n");
-                const galleryLines: string[] = [];
-                const nonGalleryLines: string[] = [];
-                let inGalleryBlock = false;
+            // ── Fast media (gallery + YouTube): used for the grounding manifest
+            // injected into the synthesizer prompt, and streamed to the client
+            // immediately so the gallery paints before/while the prose streams.
+            const fastMedia = await mediaHandle.fast;
+            galleryResultsOuter = fastMedia.galleryResults;
+            mediaContext = fastMedia.mediaContext;
+            mediaItemsForClient = fastMedia.items;
+            if (fastMedia.galleryMediaLines.length > 0) {
+              toolCallsLog.push({ tool: "getGalleryMedia", totalGalleryAssets: fastMedia.galleryMediaLines.length });
+            }
+            if (fastMedia.items.length > 0) {
+              sendEvent("media", { items: fastMedia.items, phase: "fast" });
+            }
+            sendEvent("progress", { step: "Intelligence loaded. Generating analysis..." });
 
-                for (const line of mediaLines) {
-                  if (line.includes("GALLERY MEDIA (pre-verified)")) { inGalleryBlock = true; continue; }
-                  if (line.includes("END GALLERY MEDIA")) { inGalleryBlock = false; continue; }
-                  if (line.startsWith("---")) { nonGalleryLines.push(line); continue; }
-                  if (inGalleryBlock && line.trim()) {
-                    galleryLines.push(line);
-                  } else if (line.trim()) {
-                    nonGalleryLines.push(line);
-                  }
-                }
+            // ── Slow media (live crawls + quality gate) runs in the background,
+            // overlapping LLM generation. Awaited at finalize for the final
+            // mediaContext (citation/registry/persistence) + the authoritative
+            // `media` event. The .catch keeps an inert promise if it fails.
+            fullMediaPromise = mediaHandle.runFull(bundledMediaParts);
+            fullMediaPromise.catch((e) => { console.error("media full phase error:", e); });
 
-                let finalMediaLines = [...galleryLines]; // gallery always passes through
+            exitStage('media_gather');
+            stageDiagnostics.push({ name: 'competitor_intel', status: 'ok', ms: Date.now() - competitorIntelStarted });
+            } catch (ciErr) {
+              const msg = ciErr instanceof Error ? ciErr.message : String(ciErr);
+              console.error('[safeStage:competitor_intel] failed_soft:', msg);
+              stageDiagnostics.push({
+                name: 'competitor_intel',
+                status: 'failed_soft',
+                ms: Date.now() - competitorIntelStarted,
+                error: msg.slice(0, 400),
+              });
+              // Inert fallback: leave whatever partial webIntel/mediaContext was assembled.
+            }
+          }
 
-                // Only run quality agent on non-gallery media
-                const nonGalleryContext = nonGalleryLines.filter(l => !l.startsWith("---")).join("\n");
-                if (nonGalleryContext.trim()) {
-                  const primaryCompetitor = allCompetitors[0] || competitor;
-                  const filteredResult = await filterMediaWithQualityAgent(
-                    `--- NON-GALLERY MEDIA ---\n${nonGalleryContext}\n--- END ---`,
-                    primaryCompetitor, category, subCategory
-                  );
-                  if (filteredResult) {
-                    const seenFilteredUrls = new Set<string>(galleryLines.map(l => {
-                      const m = l.match(/(https?:\/\/[^\s)]+)/);
-                      return m ? m[1].replace(/\?.*$/, "") : "";
-                    }).filter(Boolean));
+          // --- Unified research pipeline: general/supplemental research ---
+          // Fires when: general research needed, OR competitive research with no known competitors
+          // (unknown company like "stacks.ai"), OR competitive research yielded no intel.
+          if (doGeneralResearch || (doResearch && allCompetitors.length === 0) || (doResearch && !webIntel)) {
+            sendEvent("progress", { step: "Searching the web for additional intelligence..." });
+            const grStage = await safeStage<string>(
+              'general_research',
+              async () => {
+                const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY");
+                const searchItems: string[] = [];
+                const searchQueries = intentResult.searchQueries.length > 0 ? intentResult.searchQueries : [message];
 
-                    for (const line of filteredResult.split("\n")) {
-                      const urlMatch = line.match(/(https?:\/\/[^\s)]+)/);
-                      if (urlMatch) {
-                        const key = urlMatch[1].replace(/\?.*$/, "");
-                        if (seenFilteredUrls.has(key)) continue;
-                        seenFilteredUrls.add(key);
+                for (const sq of searchQueries) {
+                  if (ANTHROPIC_KEY) {
+                    // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+                    const searchResults = await claudeWebSearch(sq, 5);
+                    let discoveredUrls: { title: string; url: string; snippet: string }[] = [];
+                    for (const text of searchResults) {
+                      const urlMatch = text.match(/https?:\/\/[^\s)\]]+/);
+                      if (urlMatch?.[0]) {
+                        discoveredUrls.push({ title: text.slice(0, 100), url: urlMatch[0], snippet: text.slice(0, 300) });
                       }
-                      if (line.startsWith("---")) continue;
-                      if (line.trim()) finalMediaLines.push(line);
+                    }
+
+                    if (hasFirecrawlKey() && discoveredUrls.length > 0) {
+                      const scrapePromises = discoveredUrls.slice(0, 3).map(async (item) => {
+                        try {
+                          // CRITICAL_AWAIT_OK: live-crawl helper inside try/catch on fail-hard path
+                          const scrapeRes = await firecrawlFetch("https://api.firecrawl.dev/v1/scrape", {
+                            method: "POST",
+                            body: JSON.stringify({ url: item.url, formats: ["markdown"], onlyMainContent: true }),
+                          });
+                          if (scrapeRes.ok) {
+                            // CRITICAL_AWAIT_OK: primary HTTP I/O on fail-hard path
+                            const scrapeData = await scrapeRes.json();
+                            const fullMarkdown = scrapeData.data?.markdown || scrapeData.markdown || "";
+                            if (fullMarkdown.length > 50) {
+                              item.snippet = fullMarkdown;
+                              console.log(`General research: extracted ${fullMarkdown.length} chars from ${item.url}`);
+                            }
+                          }
+                        } catch (e) { console.error(`Firecrawl scrape failed for ${item.url}:`, e); }
+                      });
+                      await Promise.all(scrapePromises);
+                    }
+
+                    for (const item of discoveredUrls) {
+                      searchItems.push(`- "${item.title}" (${item.url})\n  ${item.snippet}`);
                     }
                   }
                 }
 
-                // Also persist any newly approved non-gallery media to media_assets for future lookups
-                // (fire-and-forget — don't block the response)
-                if (finalMediaLines.length > galleryLines.length) {
-                  const newApprovedCount = finalMediaLines.length - galleryLines.length;
-                  console.log(`${newApprovedCount} new media items approved — will persist to gallery`);
-                  persistNewMediaToGallery(
-                    allCompetitors[0] || competitor, category, subCategory,
-                    finalMediaLines.slice(galleryLines.length)
-                  ).catch(e => console.error("persistNewMediaToGallery error:", e));
-                }
-
-                mediaContext = finalMediaLines.length > 0
-                  ? `--- AVAILABLE OFFICIAL MEDIA (AI-verified, score ≥7) ---\n${finalMediaLines.join("\n")}\n--- END MEDIA ---`
+                return searchItems.length > 0
+                  ? `\n\n--- LIVE WEB RESEARCH RESULTS ---\n${searchItems.join("\n\n")}\n--- END RESEARCH ---`
                   : "";
-                toolCallsLog.push({ tool: "mediaQualityAgent", galleryMedia: galleryLines.length, newApproved: finalMediaLines.length - galleryLines.length });
-                console.log(`Media Quality Agent: ${galleryLines.length} gallery + ${finalMediaLines.length - galleryLines.length} new = ${finalMediaLines.length} total`);
-              } catch (mqErr) {
-                console.error("Media Quality Agent failed, using unfiltered media:", mqErr);
-              }
+              },
+              "",
+              { timeoutMs: 60_000 },
+            );
+            stageDiagnostics.push(grStage.diagnostics);
+            if (grStage.value) {
+              webIntel = webIntel ? webIntel + grStage.value : grStage.value;
             }
           }
 
-          // ===== Intent detection: is this follow-up related to the analysis? =====
-          const isRelatedFollowUp = isFollowUpRelatedToAnalysis(message, competitor, category, subCategory, history);
+          enterStage('prompt_assembly');
           const hasHistory = history && history.length > 0;
-          const isIndependentQuestion = hasHistory && !isRelatedFollowUp;
-
-          if (isIndependentQuestion) {
-            console.log(`Intent detection: INDEPENDENT question detected — skipping heavy context injection`);
-          }
-
           const isFullProduct = category === "Full Product" && subCategory === "Full Product";
-
           let systemPrompt: string;
           let modelUsed: string;
 
-          if (isIndependentQuestion) {
-            // Lightweight prompt for unrelated follow-ups — no intel/media/knowledge injection
-            systemPrompt = `You are a knowledgeable assistant with expertise in enterprise software, FP&A, EPM, and business technology.
+          const productAreaDesc = getProductAreaDescription(category, subCategory);
+          const productAreaContext = productAreaDesc
+            ? `\n\nPRODUCT AREA DEFINITION: "${subCategory}" in Workday Adaptive Planning means:\n"${productAreaDesc}"\n\nUse this definition to ensure your analysis focuses on capabilities that directly map to this product area.\n`
+            : "";
 
-Answer the user's question directly and concisely. The conversation history provides context for what was discussed before, but the user's current question may be on a completely different topic — answer it on its own merits.
+          const isMultiCompetitor = allCompetitors.length > 1;
+          const competitorNames = allCompetitors.join(", ");
+          const competitorLabel = allCompetitors.join(" vs ");
 
-FORMATTING RULES:
-- Use markdown for structure (## headers, bullet lists, tables where appropriate)
-- Be factual and specific
-- NEVER include system disclaimers or AI self-references
-- NEVER fabricate URLs or image references
-- NEVER expose internal adaptive planning data or proprietary information.`;
-            modelUsed = "google/gemini-2.5-flash";
-          } else {
-            // Full competitive analysis prompt with all context
-            const productAreaDesc = getProductAreaDescription(category, subCategory);
-            const productAreaContext = productAreaDesc
-              ? `\n\nPRODUCT AREA DEFINITION: "${subCategory}" in Workday Adaptive Planning means:\n"${productAreaDesc}"\n\nUse this definition to ensure your analysis focuses on capabilities that directly map to this product area.\n`
-              : "";
-
-            const isMultiCompetitor = allCompetitors.length > 1;
-            const competitorNames = allCompetitors.join(", ");
-            const competitorLabel = allCompetitors.join(" vs ");
-
-            const fullProductSections = isFullProduct ? `
+          const fullProductSections = isFullProduct ? `
 Always structure your initial analysis with these sections (use ## for section headers):
 
 ## Executive Summary
@@ -2310,7 +906,7 @@ Always structure your initial analysis with these sections (use ## for section h
 ## Strengths vs Weaknesses
 ## Reference Links`;
 
-            const multiCompetitorInstructions = isMultiCompetitor ? `
+          const multiCompetitorInstructions = isMultiCompetitor ? `
 MULTI-COMPETITOR ANALYSIS: You are comparing ${competitorNames} against Workday Adaptive Planning SIMULTANEOUSLY.
 - All comparison tables MUST include a column for EACH competitor plus Workday Adaptive Planning
 - In Strengths vs Weaknesses, provide ### sub-sections for EACH competitor AND Workday Adaptive Planning
@@ -2318,64 +914,233 @@ MULTI-COMPETITOR ANALYSIS: You are comparing ${competitorNames} against Workday 
 - Include a brief head-to-head summary at the end comparing the competitors against each other
 ` : "";
 
-            const maxChunks = isFullProduct ? 15 : 6;
-            const { context: retrievedKnowledge, chunks } = retrieveKnowledge(
-              { category, subCategory, competitor, query: message },
-              maxChunks
-            );
-            console.log(`Retrieved ${chunks.length} knowledge chunks`);
+          enterStage('doc_retrieval');
+          const maxChunks = isFullProduct ? 15 : 6;
 
-            // For follow-ups related to the analysis, include context but instruct to answer the specific question
-            const followUpInstruction = hasHistory ? `
+          const kbStage = await safeStage(
+            'doc_retrieval.retrieveKnowledge',
+            async () => retrieveKnowledge(
+              { category, subCategory, competitor, query: message },
+              maxChunks,
+            ),
+            { context: "", chunks: [] as any[] },
+            { timeoutMs: 15_000 },
+          );
+          stageDiagnostics.push(kbStage.diagnostics);
+          const { context: retrievedKnowledge, chunks } = kbStage.value;
+          console.log(`Retrieved ${chunks.length} knowledge chunks${kbStage.degraded ? " [degraded]" : ""}`);
+
+          // On-demand doc-library retrieval (Hybrid: FTS narrows → extractor pulls answer-bearing snippets).
+          // Adaptive (current capability) and roadmap (future/unreleased) retrieval run in PARALLEL,
+          // each independently wrapped in safeStage with the same 30s budget + inert fallback.
+          const [docStage, roadmapStage] = await Promise.all([
+            safeStage(
+              'doc_retrieval.retrieveDocKnowledge',
+              async () => retrieveDocKnowledge({
+                query: message,
+                competitor: competitorLabel || undefined,
+                subCategory: !isFullProduct ? subCategory : undefined,
+                maxChunks: isFullProduct ? 12 : 8,
+                candidateLimit: 60,
+                hybridExtract: true,
+              }),
+              { context: "", sources: [] as any[], hitCount: 0, mode: "fallback_inert" } as any,
+              { timeoutMs: 30_000 },
+            ),
+            safeStage(
+              'doc_retrieval.retrieveRoadmapKnowledge',
+              async () => retrieveRoadmapKnowledge({
+                query: message,
+                competitor: competitorLabel || undefined,
+                subCategory: !isFullProduct ? subCategory : undefined,
+                maxChunks: isFullProduct ? 12 : 8,
+                candidateLimit: 60,
+                hybridExtract: true,
+              }),
+              { context: "", sources: [] as any[], hitCount: 0, mode: "fallback_inert" } as any,
+              { timeoutMs: 30_000 },
+            ),
+          ]);
+          stageDiagnostics.push(docStage.diagnostics);
+          stageDiagnostics.push(roadmapStage.diagnostics);
+          const docKnowledge = docStage.value;
+          const roadmapKnowledge = roadmapStage.value;
+          console.log(
+            `Retrieved ${docKnowledge.sources.length}/${docKnowledge.hitCount} doc chunks ` +
+            `[mode=${docKnowledge.mode}] (${docKnowledge.sources.map((s: any) => s.doc).join(", ")})${docStage.degraded ? " [degraded]" : ""}`
+          );
+          console.log(
+            `Retrieved ${roadmapKnowledge.sources.length}/${roadmapKnowledge.hitCount} roadmap chunks ` +
+            `[mode=${roadmapKnowledge.mode}] (${roadmapKnowledge.sources.map((s: any) => s.doc).join(", ")})${roadmapStage.degraded ? " [degraded]" : ""}`
+          );
+          exitStage('doc_retrieval');
+
+          const followUpInstruction = hasHistory ? `
 
 IMPORTANT: The user is asking a follow-up question. Answer their SPECIFIC question directly — do NOT regenerate the full structured analysis. Use the context below to inform your answer but keep the response focused and concise.` : "";
 
-            systemPrompt = `You are a Competitive Intelligence Analyst specializing in enterprise FP&A and EPM software, with deep expertise in Workday Adaptive Planning.
+          // Sheet-provided facts (XLSX knowledge base) — authoritative ground truth
+          // CRITICAL_AWAIT_OK: competitor profile lookup inside try/catch
+          const sheetProfiles = await getProfilesByNames(allCompetitors);
+          const sheetFactsBlock = formatProfilesForPrompt(sheetProfiles);
+          if (sheetProfiles.length > 0) {
+            console.log(`SHEET-PROVIDED FACTS injected for ${sheetProfiles.length}/${allCompetitors.length} competitors`);
+          }
 
-Your role: Generate structured, factual competitive breakdowns comparing ${competitorLabel} against Workday Adaptive Planning${isFullProduct ? " as a complete product across all major capability areas" : ` in the ${subCategory} capability area (${category})`}.
+          // Community signals are MANDATORY whenever items exist for the resolved
+          // competitor(s). The availability signal already lives on feedEvidence;
+          // we thread it to the prompt (here) and the contract (T4) — no new
+          // infrastructure, just branching on existing data.
+          const hasCommunityItems = feedEvidence.communityItems.length > 0;
+          const communityMandate = hasCommunityItems
+            ? `
+COMMUNITY SENTIMENT (MANDATORY — community items are available for ${competitorLabel || "the competitor(s)"}):
+- The INTELLIGENCE BRIEF contains a "## COMMUNITY SIGNALS" block with real user/community discussion items.
+- You MUST include a "## Community Sentiment" section that synthesizes those signals — user opinions, complaints, praise, reviews, and recurring themes — and cite each item's source_url with markdown links.
+- Do NOT omit this section and do NOT replace it with a generic disclaimer. Summarize what the community is actually saying.`
+            : "";
+
+          systemPrompt = `You are a Competitive Intelligence Analyst specializing in enterprise FP&A and EPM software, with deep expertise in Workday Adaptive Planning. You also excel at general company research.
+
+Your role: Generate structured, factual competitive breakdowns comparing ${competitorLabel || "competitors"} against Workday Adaptive Planning${isFullProduct ? " as a complete product across all major capability areas" : ` in the ${subCategory} capability area (${category})`}.
 ${multiCompetitorInstructions}${productAreaContext}${followUpInstruction}
 
-${retrievedKnowledge ? `--- WORKDAY ADAPTIVE PLANNING REFERENCE KNOWLEDGE ---\n${retrievedKnowledge}\n--- END REFERENCE KNOWLEDGE ---` : ""}
+${sheetFactsBlock ? sheetFactsBlock + "\n" : ""}
+${retrievedKnowledge ? `--- WORKDAY ADAPTIVE PLANNING — INTERNAL CAPABILITY FACTS ---\n${retrievedKnowledge}\n--- END INTERNAL CAPABILITY FACTS ---` : ""}
+${docKnowledge.context ? `--- ADAPTIVE PLANNING — DOC LIBRARY EXCERPTS ---\n(Authoritative excerpts from Workday Adaptive Planning documentation, formula reference, release notes, and glossary. Use these as ground truth when comparing against competitors.)\n${docKnowledge.context}\n--- END DOC LIBRARY EXCERPTS ---` : ""}
+${roadmapKnowledge.context ? `--- ROADMAP ITEMS (FUTURE / NOT YET RELEASED) ---\n(These passages describe PLANNED / UNRELEASED Workday Adaptive Planning capability. They are NOT current product state. Each passage is tagged [roadmap: …]. See the ROADMAP TAGGING RULE below — any sentence you derive from these MUST end with "(roadmap)".)\n${roadmapKnowledge.context}\n--- END ROADMAP ITEMS ---` : ""}
+
 
 ${webIntel ? `--- INTELLIGENCE BRIEF ---\n${webIntel}\n--- END BRIEF ---` : ""}
 ${!hasHistory ? fullProductSections : ""}
 
+CRITICAL OUTPUT RULES:
+- ROADMAP TAGGING RULE (HARD RULE): Some of your evidence is tagged as ROADMAP (passages tagged [roadmap: …] under "ROADMAP ITEMS (FUTURE / NOT YET RELEASED)"). This evidence describes future / unreleased product capability for Adaptive Planning, NOT current state. For EVERY sentence you derive from roadmap evidence you MUST do BOTH of the following: (1) cite the roadmap source inline with a [roadmap: source] marker — exactly the same way you cite normal evidence with [Source: …]; and (2) end that same sentence with the user-visible "(roadmap)" suffix. A sentence that uses roadmap content but is missing either the [roadmap: …] citation or the "(roadmap)" suffix is a contract violation. Do NOT mix roadmap content into a sentence that also describes current capability — split it into separate sentences, and only the roadmap sentence carries the [roadmap: …] citation and the "(roadmap)" suffix.
+- Synthesize ALL available intelligence into comprehensive findings. Present what you know confidently and note gaps briefly.
+- NEVER output empty tables, placeholder frameworks, or "what to look for" templates. Every table cell must contain actual data.
+- NEVER ask "which company do you mean?" — research the most likely match and state your assumption. If ambiguous, note which company you researched.
+- Use "Not found" ONLY when you have absolutely zero information for a specific field. If you have partial data, present it and note what's missing.
+- NEVER punt research to the user. Do NOT say "try searching for...", "you can find this at...", or "check LinkedIn for...". YOU are the researcher — present your findings definitively.
+- If scraped website content is available, extract and present ALL useful information from it (product description, features, team, pricing, integrations, etc.).
+
+SCOPE GUARDRAIL (CRITICAL):
+- Your domain is competitive intelligence for **financial planning, workforce planning, FP&A, EPM/CPM, accounting, consolidation, treasury, and adjacent enterprise finance software**.
+- Decline (briefly, professionally) to research companies, products, or topics with no plausible connection to that domain. Example refusal: "That topic is outside the FP&A/EPM scope I cover. Try asking about a planning vendor or capability."
+- Vendors present in the SHEET-PROVIDED FACTS block above are IN scope by definition — research them fully.
+
+GENERAL RESEARCH CAPABILITY (within FP&A/EPM scope only):
+- Answer questions about company leadership (CEO, CTO, founders), LinkedIn profiles, and backgrounds
+- Provide funding round details, revenue estimates, valuations, and investor information
+- Determine company size/segment (mid-market, enterprise, SMB, employee count)
+- Research market size, TAM, and industry positioning
+- Find information about acquisitions, partnerships, and strategic moves
+- Always cite sources when using live research results
+
 FORMATTING RULES (CRITICAL — follow precisely):
 - Use markdown tables (with | delimiters) for comparisons
-- Use ## for major section headers (e.g. "## Strengths vs Weaknesses", "## Executive Summary")
-- Use ### for sub-section headers (e.g. "### Workday Adaptive Planning — Strengths", "### Planful — Potential Gaps")
-- NEVER put section headers or sub-headers as bullet points. Headers MUST use ## or ### markdown syntax.
-- A line like "CompanyName — SectionName" is ALWAYS a header, never a bullet point.
+- Use ## for major section headers
+- Use ### for sub-section headers
+- NEVER put section headers or sub-headers as bullet points
 - Use plain text paragraphs for descriptions
-- Use bullet lists (starting with -) ONLY for actual enumerated content items, never for section titles
+- Use bullet lists (starting with -) ONLY for actual enumerated content items
 - Always include full URLs as plain text so they can be hyperlinked
-- Be factual. If you don't know something, state what is known and what requires further verification — never use phrases like "I don't have access" or "as an AI"
-- NEVER include system disclaimers, AI self-references, or technical limitation notes. Convert any internal observations into user-facing insights.
-- Avoid marketing language. Focus on technical and functional capabilities.
+- Be factual
+- NEVER include system disclaimers, AI self-references, or technical limitation notes
+- Avoid marketing language
+- When citing research results, use markdown link syntax [Source](URL)
+- CITATION DEPTH (CRITICAL): every URL you cite MUST include a non-trivial page path (e.g. https://example.com/features or /pricing). Domain-only links like https://example.com/ are NOT valid evidence and will be rejected. Pull deep paths from the INTELLIGENCE BRIEF above (look for "[Sheet-priority crawl: <url>]" markers).
+- EMPTY CITATIONS FORBIDDEN: NEVER emit "[Source]()", "[Source]( )", or any markdown link with an empty/whitespace-only URL. If you don't have a real deep URL for a claim, omit the citation entirely. Empty source placeholders will be stripped and counted as a quality failure.
+- ADAPTIVE PLANNING VOICE: When citing Workday Adaptive Planning capabilities, state them as established facts (e.g. "Adaptive Planning supports X"). NEVER use phrases like "per provided reference knowledge", "per the reference", "per provided knowledge", "according to the provided reference", or any meta-reference to the source of Adaptive Planning information.
+- SOURCES SCOPE: The "## Sources" and any "## Reference Links" section must list ONLY article/blog/doc URLs. NEVER place image, screenshot, or video URLs (YouTube, Vimeo, Wistia, Loom, .png, .jpg, .webp, /storage/v1/object/public/, competitor-screenshots) in those sections — those belong only in Visual Overview.
+- FEED EVIDENCE PRIORITY: When a "## FEED-CURATED NEWS" or "## COMMUNITY SIGNALS" block is present in the INTELLIGENCE BRIEF, treat those items as the primary evidence for recency, announcements, sentiment, reviews, and "what's the latest" questions. They are pre-curated, dated, and source-attributed — cite their source_url directly rather than re-stating without a link.
+- End every substantive response with a "## Sources" section listing the deep URLs you cited.
+${communityMandate}
 ${!hasHistory ? `
-RESPONSE STRUCTURE (MANDATORY — follow this exact order):
-1. FIRST: Start with a "## Visual Overview" section containing ALL provided media
-2. THEN: Executive Summary
-3. THEN: Detailed comparison sections with tables
-4. LAST: Reference Links
+RESPONSE STRUCTURE (MANDATORY):
+1. FIRST: Executive Summary
+2. THEN: Detailed comparison sections with tables
+3. LAST: Reference Links
 
-MEDIA REFERENCES:
-${mediaContext || "No official media references were found for this query."}
-
-MANDATORY media rules (CRITICAL — violations are treated as failures):
-- You may ONLY use image/video URLs that appear in the MEDIA REFERENCES section above
-- Do NOT fabricate, guess, or generate any image or video URLs under any circumstances
-- Do NOT use YouTube thumbnail URLs, placeholder image services, or stock photo URLs
-- Do NOT invent URLs based on patterns you've seen — if it's not listed above, don't use it
-- Place ALL provided media items in "## Visual Overview" at the VERY START
-- For images: ![Description](url)
-- For videos: [VIDEO: Description](url)
-- If no media references are provided above, skip the Visual Overview section entirely — do NOT create one with made-up URLs` : `
-Do NOT include a Visual Overview section or any media/image references in follow-up responses unless specifically asked.`}
+VISUAL MEDIA HANDLING (CRITICAL):
+- A "Visual Overview" gallery of screenshots and videos is gathered by a SEPARATE media pipeline and rendered automatically alongside your response. You do NOT author it.
+- Do NOT write a "## Visual Overview" section, and do NOT emit any image markdown (![alt](url)) or video tokens ([VIDEO: ...](url)). Any media URLs you emit will be stripped from the prose.
+- If a specific screenshot or video is needed to support a claim and it is NOT already in the "RETRIEVED VISUAL EVIDENCE" list (if present below), emit a control token on its own line: <<NEEDS_MEDIA: short entity or description>>. The media pipeline will fetch it on-demand and surface it in the gallery. Use sparingly.` : `
+Do NOT include a Visual Overview section or media/image markdown in follow-up responses unless specifically asked. To pull a specific image/video into the gallery, emit <<NEEDS_MEDIA: description>> on its own line.`}
 
 IMPORTANT: Never expose internal adaptive planning data or proprietary information.`;
-            modelUsed = "openai/gpt-5";
+
+          // ---------------------- D3: Evidence Manifest ----------------------
+          // Extract every (title, url) pair from mediaContext so the synthesizer
+          // SEES the visual evidence the user is rendering inline. Without this,
+          // the LLM writes "details not evidenced" while we display the proof.
+          //
+          // Format expected in mediaContext lines:
+          //   ![Title or alt text](https://host/path/file.png)
+          //   - https://host/path/file.png  (Title)  (from https://host/page)
+          // We pull both image URLs and their (from <source-page>) URLs and
+          // dedupe by source-page URL (the deep article/doc URL is what the
+          // synthesizer should cite, not the screenshot CDN URL).
+          const evidenceManifest: { title: string; url: string; slug: string }[] = [];
+          if (mediaContext) {
+            const seenUrls = new Set<string>();
+            const slugify = (raw: string) => {
+              try {
+                const u = new URL(raw);
+                const lastSeg = u.pathname.split("/").filter(Boolean).pop() || u.hostname;
+                return lastSeg.replace(/\.[a-z0-9]{2,5}$/i, "").replace(/[^a-z0-9-_]+/gi, "-").toLowerCase();
+              } catch { return raw.slice(-40); }
+            };
+            // Pattern A: markdown image with following (from URL) marker
+            const imgRe = /!\[([^\]]*)\]\(([^)]+)\)(?:\s*\(from\s+(https?:\/\/[^)\s]+)\))?/g;
+            for (const m of mediaContext.matchAll(imgRe)) {
+              const title = (m[1] || "").trim() || "Untitled";
+              const sourceUrl = (m[3] || m[2]).replace(/[.,;:!?)]+$/, "");
+              if (!sourceUrl || seenUrls.has(sourceUrl)) continue;
+              seenUrls.add(sourceUrl);
+              evidenceManifest.push({ title: title.slice(0, 120), url: sourceUrl, slug: slugify(sourceUrl) });
+              if (evidenceManifest.length >= 30) break;
+            }
+            // Pattern B: bare "(from URL)" markers without preceding image (gallery-only)
+            if (evidenceManifest.length < 30) {
+              const fromRe = /\(from\s+(https?:\/\/[^)\s]+)\)/g;
+              for (const m of mediaContext.matchAll(fromRe)) {
+                const sourceUrl = m[1].replace(/[.,;:!?)]+$/, "");
+                if (!sourceUrl || seenUrls.has(sourceUrl)) continue;
+                seenUrls.add(sourceUrl);
+                evidenceManifest.push({ title: "Source page", url: sourceUrl, slug: slugify(sourceUrl) });
+                if (evidenceManifest.length >= 30) break;
+              }
+            }
           }
+
+          if (evidenceManifest.length > 0) {
+            // Never expose raw screenshot/CDN/image URLs to the synthesizer. When
+            // it sees a media URL it echoes it back as `![title](url)` image
+            // markdown into the PROSE stream — redundant media (the gallery
+            // already has it from the media channel) that also drives the
+            // media-in-prose render hazards. Show the TITLE only for media/CDN
+            // URLs (the model can still cite the capability as an observed fact);
+            // keep real article/source URLs so citations still work.
+            const isMediaCdnUrl = (u: string) =>
+              /\.(?:png|jpe?g|gif|webp|svg|mp4|webm|mov|ogg)(?:\?|$)/i.test(u) ||
+              /\/storage\/v1\/object\/public\//.test(u) ||
+              /competitor-screenshots/.test(u);
+            const manifestBlock = evidenceManifest
+              .slice(0, 20)
+              .map((e) => (isMediaCdnUrl(e.url) ? `- ${e.title}` : `- [${e.title}] ${e.url}`))
+              .join("\n");
+            systemPrompt += `
+
+## RETRIEVED VISUAL EVIDENCE (already shown to user inline)
+${manifestBlock}
+
+EVIDENCE UTILIZATION RULES (CRITICAL):
+- The items above are evidence the user can SEE in the Visual Overview gallery (rendered separately). You MUST treat them as observed facts. NEVER write them back as image markdown — the gallery already shows them.
+- If a title clearly demonstrates a capability (e.g. "XL Reporting Services"), do NOT write "specific details not evidenced" or "no public information" for that capability — acknowledge what the visual evidence shows.
+- If you genuinely need the full text content of one of these pages to support a specific claim, emit at most 3 control tokens of the form: <<NEEDS_SCRAPE: https://full-url>> on their own lines at the END of your response. The orchestrator will scrape those pages and re-invoke you with the deep content. Use this sparingly — only when a claim cannot be made without the page body.`;
+          }
+
+          modelUsed = "openai/gpt-5.5";
 
           const sanitizedHistory = (history || []).filter(
             (msg: any) => msg && typeof msg.content === "string" && msg.content.trim() !== ""
@@ -2388,9 +1153,10 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
 
           const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
 
+          exitStage('prompt_assembly');
           sendEvent("progress", { step: "AI model generating response..." });
 
-          // ===== OPTIMIZATION F: Token streaming =====
+          // CRITICAL_AWAIT_OK: primary LLM generation — fail-hard by design
           const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
@@ -2398,6 +1164,7 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
           });
 
           if (!response.ok) {
+            // CRITICAL_AWAIT_OK: primary HTTP I/O on fail-hard path
             const errText = await response.text();
             console.error("AI gateway error:", response.status, errText);
 
@@ -2407,22 +1174,19 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
               competitor_name: competitor, system_prompt: systemPrompt, user_prompt: message,
               retrieved_documents: retrievedDocs, tool_calls: toolCallsLog,
               model_used: modelUsed, status: "error", error_message: `AI gateway error: ${response.status}`,
-              latency_ms: latencyMs, trace_type: 'conversation',
-            }).then(() => {}).catch(() => {});
+              latency_ms: latencyMs, trace_type: 'conversation', agent_source: 'comp_agent',
+              prompt_tokens: null, completion_tokens: null, total_tokens: null,
+            }).then(() => {}, () => {});
 
-            if (response.status === 429) {
-              sendEvent("error", { content: "Rate limit exceeded. Please try again in a moment." });
-            } else if (response.status === 402) {
-              sendEvent("error", { content: "Usage credits exhausted. Please add credits." });
-            } else {
-              sendEvent("error", { content: `AI gateway error (${response.status}). Please try again.` });
-            }
+            if (response.status === 429) sendEvent("error", { content: "Rate limit exceeded. Please try again in a moment." });
+            else if (response.status === 402) sendEvent("error", { content: "Usage credits exhausted. Please add credits." });
+            else sendEvent("error", { content: `AI gateway error (${response.status}). Please try again.` });
             clearInterval(keepalive);
             controller.close();
             return;
           }
 
-          // Stream tokens to client
+          // Stream tokens
           let fullContent = "";
           let usage: any = {};
           const reader = response.body?.getReader();
@@ -2431,40 +1195,29 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
 
           if (reader) {
             while (true) {
+              // CRITICAL_AWAIT_OK: SSE stream loop — fail-hard by design
               const { done, value } = await reader.read();
               if (done) break;
-
               streamBuffer += decoder.decode(value, { stream: true });
-
               let newlineIndex: number;
               while ((newlineIndex = streamBuffer.indexOf("\n")) !== -1) {
                 let line = streamBuffer.slice(0, newlineIndex);
                 streamBuffer = streamBuffer.slice(newlineIndex + 1);
-
                 if (line.endsWith("\r")) line = line.slice(0, -1);
                 if (!line.startsWith("data: ")) continue;
-
                 const jsonStr = line.slice(6).trim();
                 if (jsonStr === "[DONE]") break;
-
                 try {
                   const parsed = JSON.parse(jsonStr);
                   const delta = parsed.choices?.[0]?.delta?.content;
-                  if (delta) {
-                    fullContent += delta;
-                    sendEvent("token", { token: delta });
-                  }
+                  if (delta) { fullContent += delta; sendEvent("token", { token: delta }); }
                   if (parsed.usage) usage = parsed.usage;
-                } catch {
-                  // incomplete JSON, put back
-                  streamBuffer = line + "\n" + streamBuffer;
-                  break;
-                }
+                } catch { streamBuffer = line + "\n" + streamBuffer; break; }
               }
             }
           }
 
-          // Flush remaining buffer
+          // Flush remaining
           if (streamBuffer.trim()) {
             for (let raw of streamBuffer.split("\n")) {
               if (!raw) continue;
@@ -2475,18 +1228,16 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
               try {
                 const parsed = JSON.parse(jsonStr);
                 const delta = parsed.choices?.[0]?.delta?.content;
-                if (delta) {
-                  fullContent += delta;
-                  sendEvent("token", { token: delta });
-                }
+                if (delta) { fullContent += delta; sendEvent("token", { token: delta }); }
                 if (parsed.usage) usage = parsed.usage;
-              } catch { /* ignore */ }
+              } catch {}
             }
           }
 
           let content = fullContent || "Unable to generate analysis. Please try again.";
 
-          // ===== Sanitize system-like disclaimers from the response =====
+          // Sanitize disclaimers (still needed regardless of pipeline path —
+          // these patterns are about model voice, not source handling).
           const disclaimerPatterns = [
             /I don['']t have (?:access|real-time access) to[^.]*\./gi,
             /I(?:'m| am) unable to (?:access|retrieve|browse|verify)[^.]*\./gi,
@@ -2504,8 +1255,106 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
             content = content.replace(pattern, "").trim();
           }
 
-          // ===== ANTI-FABRICATION GUARD =====
-          // Build a whitelist of allowed media URLs from the media context
+          // Strip "per provided reference knowledge" meta-references.
+          const adaptiveMetaRefPatterns = [
+            /\s*\(?\s*per\s+(?:the\s+)?(?:provided\s+)?(?:reference\s+)?knowledge\s*\)?/gi,
+            /\s*\baccording to (?:the )?(?:provided )?reference(?:\s+knowledge)?\b/gi,
+            /\s*\bas (?:per|stated in) (?:the )?(?:provided )?reference(?:\s+knowledge)?\b/gi,
+            /\s*\(?\s*per\s+(?:the\s+)?internal\s+capability\s+facts\s*\)?/gi,
+          ];
+          for (const pattern of adaptiveMetaRefPatterns) {
+            content = content.replace(pattern, "");
+          }
+
+          // ---------------------- D3: NEEDS_SCRAPE escape hatch ----------------------
+          // If the synthesizer emitted <<NEEDS_SCRAPE: url>> tokens, scrape those
+          // pages once via firecrawl-scrape and re-invoke synthesis with the deep
+          // content appended. Cap at 3 URLs and 1 round to bound cost/latency.
+          let evidenceRescrape: { requested: number; scraped: number; round: number } = { requested: 0, scraped: 0, round: 0 };
+          {
+            const SCRAPE_TOKEN_RE = /<<\s*NEEDS_SCRAPE\s*:\s*(https?:\/\/[^\s>]+)\s*>>/gi;
+            const requested = [...content.matchAll(SCRAPE_TOKEN_RE)].map((m) => m[1].replace(/[.,;:!?)]+$/, ""));
+            const uniqueRequested = Array.from(new Set(requested)).slice(0, 3);
+            evidenceRescrape.requested = uniqueRequested.length;
+
+            // Strip the tokens from the visible draft regardless of whether we re-synthesize.
+            content = content.replace(SCRAPE_TOKEN_RE, "").trim();
+
+            if (uniqueRequested.length > 0) {
+              sendEvent("progress", { step: `Deep-scraping ${uniqueRequested.length} cited page(s)...` });
+              const scrapeResults = await Promise.all(uniqueRequested.map(async (url) => {
+                try {
+                  const r = await safeStage(
+                    `evidence_rescrape:${url.slice(0, 60)}`,
+                    async () => {
+                      const { data, error } = await supabaseService.functions.invoke("firecrawl-scrape", {
+                        body: { url, options: { formats: ["markdown"], onlyMainContent: true } },
+                      });
+                      if (error) throw new Error(error.message);
+                      const md = (data?.data?.markdown || data?.markdown || "").toString().slice(0, 4000);
+                      return md ? { url, md } : null;
+                    },
+                    null as null | { url: string; md: string },
+                    { timeoutMs: 30_000 },
+                  );
+                  return r.value;
+                } catch { return null; }
+              }));
+              const scraped = scrapeResults.filter((x): x is { url: string; md: string } => !!x);
+              evidenceRescrape.scraped = scraped.length;
+
+              if (scraped.length > 0) {
+                evidenceRescrape.round = 1;
+                const deepBlock = scraped.map((s) => `### ${s.url}\n${s.md}`).join("\n\n---\n\n");
+                const rescrapeMessages = [
+                  { role: "system", content: systemPrompt + `\n\n## DEEP-SCRAPED EVIDENCE\n${deepBlock}\n\nUse the deep-scraped evidence above to revise the draft below. Preserve everything that is correct; remove or correct any "not evidenced" claims that the new evidence resolves. Return the FULL revised response.` },
+                  { role: "user", content: `Original user prompt: ${message}\n\nPrevious draft to revise:\n\n${content.slice(0, 14000)}` },
+                ];
+                try {
+                  const rescrapeRes = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${Deno.env.get("LOVABLE_API_KEY")}` },
+                    body: JSON.stringify({ model: modelUsed, messages: rescrapeMessages, max_completion_tokens: 20000 }),
+                  });
+                  if (rescrapeRes.ok) {
+                    const rj = await rescrapeRes.json();
+                    const revised = (rj.choices?.[0]?.message?.content || "").trim();
+                    if (revised && revised.length >= content.length * 0.5) {
+                      content = revised;
+                      // Do NOT emit an interim `content` event here: it carries no
+                      // messageId, so the client would treat it as finalization
+                      // (legacy insert path → nulls streamingBubbleId), and the
+                      // authoritative final `content` event would then find no
+                      // bubble to promote and insert a DUPLICATE row. The revised
+                      // draft flows into the single final `content` event below.
+                      console.log(`[evidence_rescrape] applied revision (${scraped.length} URLs, ${revised.length} chars)`);
+                    }
+                  }
+                } catch (e) {
+                  console.error("[evidence_rescrape] re-synthesis failed:", e);
+                }
+              }
+            }
+          }
+
+          // ---------------------- NEEDS_MEDIA token strip ----------------------
+          // The synthesizer may emit <<NEEDS_MEDIA: query>> tokens. Strip them
+          // from the VISIBLE prose now (cheap, deterministic). The actual
+          // on-demand gather — like the slow media phase and the Visual Overview
+          // reconstruction — runs in the BACKGROUND task after the stream closes,
+          // so NOTHING media-bound gates the prose-done signal (`content`/`done`).
+          // This is the root-cause fix for the "stuck at the end" stall: media
+          // finalization is no longer on the critical path between the last token
+          // and stream close (see SSE CONTRACT above).
+          const MEDIA_TOKEN_RE = /<<\s*NEEDS_MEDIA\s*:\s*([^>]+?)\s*>>/gi;
+          const needsMediaRequests = Array.from(new Set(
+            [...content.matchAll(MEDIA_TOKEN_RE)].map((m) => m[1].trim()).filter(Boolean),
+          )).slice(0, 3);
+          content = content.replace(MEDIA_TOKEN_RE, "").trim();
+
+          // allowedMediaUrls from the media gathered SO FAR (fast phase). The
+          // synthesizer no longer authors media, so this only guards stray URLs;
+          // the canonical gallery is reconstructed in the background.
           const allowedMediaUrls = new Set<string>();
           if (mediaContext) {
             for (const match of mediaContext.matchAll(/https?:\/\/[^\s)]+/g)) {
@@ -2513,142 +1362,402 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
             }
           }
 
-          // Strip any image markdown that references URLs NOT in the whitelist
-          // This catches LLM-fabricated YouTube thumbnails, stock photos, etc.
-          content = content.replace(/!\[[^\]]*\]\((https?:\/\/[^)]+)\)/g, (match, url) => {
-            const normalizedUrl = url.replace(/\?.*$/, "");
-            if (allowedMediaUrls.has(normalizedUrl)) return match; // keep verified
-            // Check if it's a sub-path match (e.g. storage bucket URLs)
-            for (const allowed of allowedMediaUrls) {
-              if (normalizedUrl.startsWith(allowed) || allowed.startsWith(normalizedUrl)) return match;
+          // ---------- Build the source registry (used by V2 finalization) ----------
+          // (probe removed — flat-shared layout deployed)
+          const registry = new EvidenceSourceRegistry();
+          if (webIntel) {
+            const urls = (webIntel.match(/https?:\/\/[^\s)\]"]+/gi) || []);
+            for (const u of urls.slice(0, 60)) {
+              const clean = u.replace(/[.,;:!?)]+$/, "");
+              try {
+                const path = new URL(clean).pathname;
+                if (path && path !== "/" && path.length > 1) {
+                  registry.register({ kind: "web", url: clean });
+                }
+              } catch { /* skip */ }
             }
-            console.log(`[anti-fabrication] Stripped fabricated image URL: ${url}`);
-            return ""; // remove fabricated image
-          });
-
-          // Also strip fabricated video links not in whitelist
-          content = content.replace(/\[VIDEO:[^\]]*\]\((https?:\/\/[^)]+)\)/g, (match, url) => {
-            const normalizedUrl = url.replace(/\?.*$/, "");
-            if (allowedMediaUrls.has(normalizedUrl)) return match;
-            for (const allowed of allowedMediaUrls) {
-              if (normalizedUrl.startsWith(allowed) || allowed.startsWith(normalizedUrl)) return match;
-            }
-            console.log(`[anti-fabrication] Stripped fabricated video URL: ${url}`);
-            return "";
-          });
-
-          content = content.replace(/\n{3,}/g, '\n\n').trim();
-
-          // Post-processing: ensure verified media URLs render properly
+          }
           if (mediaContext) {
-            const mediaUrls = [...mediaContext.matchAll(/https?:\/\/[^\s)]+/g)].map(m => m[0]);
-            const mediaLines = mediaContext.split("\n");
-
-            const allMediaTokens: string[] = [];
-            const seenUrls = new Set<string>();
-            for (const url of mediaUrls) {
-              const isImageUrl = /\.(?:png|jpe?g|gif|webp|svg)(?:\?|$)/i.test(url) || url.includes("competitor-screenshots");
-              const isVideo = !isImageUrl && (
-                url.includes("youtube.com/watch") || url.includes("youtu.be/") ||
-                url.includes("vimeo.com/") || url.includes("wistia.com/") ||
-                url.includes("vidyard.com/") || url.includes("loom.com/") ||
-                /\.(?:mp4|webm|mov|ogg)(?:\?|$)/i.test(url)
-              );
-              if (!isImageUrl && !isVideo) continue;
-              const dedupeKey = url.replace(/\?.*$/, "");
-              if (seenUrls.has(dedupeKey)) continue;
-              seenUrls.add(dedupeKey);
-              const refLine = mediaLines.find(l => l.includes(url));
-              let desc = refLine ? refLine.replace(/\[.*?\]\s*/, "").replace(url, "").replace(/[:\s]+$/, "").trim() : "";
-              // Extract source page URL from (from URL) pattern
-              const fromMatch = desc.match(/\(from\s+(https?:\/\/[^)]+)\)/);
-              const sourcePageUrl = fromMatch ? fromMatch[1] : "";
-              desc = desc.replace(/\(from[^)]*\)/g, "").trim();
-              desc = desc || `${competitor} product`;
-              // Embed source page URL in markdown title attribute for frontend parsing
-              const token = isVideo
-                ? `[VIDEO: ${desc}](${url})`
-                : sourcePageUrl
-                  ? `![${desc}](${url} "${sourcePageUrl}")`
-                  : `![${desc}](${url})`;
-              allMediaTokens.push(token);
-            }
-
-            allMediaTokens.sort((a, b) => {
-              const aIsCrawled = a.includes("competitor-screenshots") ? 0 : 1;
-              const bIsCrawled = b.includes("competitor-screenshots") ? 0 : 1;
-              return aIsCrawled - bIsCrawled;
-            });
-
-            if (allMediaTokens.length > 0) {
-              content = content.replace(/## Visual Overview\s*\n[\s\S]*?(?=\n## )/, '').trim();
-              for (const url of mediaUrls) {
-                const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                content = content.replace(new RegExp(`!\\[[^\\]]*\\]\\(${escapedUrl}\\)`, 'g'), '');
-                content = content.replace(new RegExp(escapedUrl, 'g'), '');
-              }
-              content = content.replace(/\n{3,}/g, '\n\n').trim();
-              content = `## Visual Overview\n\n${allMediaTokens.join("\n\n")}\n\n${content}`;
+            for (const fm of mediaContext.matchAll(/\(from\s+(https?:\/\/[^)\s]+)\)/g)) {
+              const clean = fm[1].replace(/[.,;:!?)]+$/, "");
+              try {
+                const path = new URL(clean).pathname;
+                if (path && path !== "/" && path.length > 1) {
+                  registry.register({ kind: "media_source_page", url: clean });
+                }
+              } catch { /* skip */ }
             }
           }
+          for (const u of feedEvidence.urls) {
+            registry.register({ kind: "feed", url: u });
+          }
+          for (const s of docKnowledge.sources) {
+            registry.register({
+              kind: "doc",
+              docRef: `${s.doc}${s.section ? ` › ${s.section}` : ""}`,
+              title: s.title ?? undefined,
+            });
+          }
 
-          // Send final processed content
-          sendEvent("content", { content });
+          let finalizeDiag: Record<string, unknown> | undefined;
 
-          const latencyMs = Date.now() - traceStartTime;
+          // Structured finalization (V2 — sole path).
+          // Whitespace + remaining cleanup in one deterministic, side-effect-free pass.
+          content = content.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+([.,;:!?])/g, "$1");
 
-          let traceId: string | null = null;
-          try {
-            const { data: traceData } = await supabaseService.from("agent_traces").insert({
-              user_id: user.id, thread_id: threadId || null, category, sub_category: subCategory,
-              competitor_name: competitor, system_prompt: systemPrompt, user_prompt: message,
-              retrieved_documents: retrievedDocs, tool_calls: toolCallsLog,
-              raw_llm_output: content, formatted_output: content,
-              model_used: modelUsed,
-              latency_ms: latencyMs, prompt_tokens: usage.prompt_tokens || null,
-              completion_tokens: usage.completion_tokens || null, total_tokens: usage.total_tokens || null,
-              status: "completed", trace_type: "conversation", agent_source: "comp_agent",
-              metadata: {
-                slide_summary_status: "pending",
-                slide_summary_model: "openai/gpt-5-nano",
+          // NOTE: the canonical "## Visual Overview" is NOT reconstructed here.
+          // It is built in the BACKGROUND task (after stream close) from the final
+          // media set and embedded into the PERSISTED content only — keeping media
+          // finalization off the prose-done critical path. The LIVE client renders
+          // the gallery from the `media` SSE channel (fast phase, already sent);
+          // reload re-derives it from the persisted content. `content` here is
+          // prose-only.
+
+          const finalized = finalizeResponse({
+            markdown: content,
+            registry,
+            allowedMediaUrls,
+            appendCanonicalSources: true,
+          });
+          content = finalized.markdown;
+          finalizeDiag = finalized.diagnostics as unknown as Record<string, unknown>;
+
+
+          // ===== RESPONSE CONTRACT GATE =====
+          // Run the contract synchronously: validate, repair (if needed), and
+          // judge with retries. Replaces the prior fire-and-forget judge call
+          // and eliminates the silent-null judge_scores class entirely.
+          // Extract deep crawled URLs from the intelligence brief so the citation
+          // repair can substitute domain-only links with real evidence paths.
+          const crawledUrlSet = new Set<string>();
+          if (webIntel) {
+            const urls = (webIntel.match(/https?:\/\/[^\s)\]"]+/gi) || []);
+            for (const u of urls) {
+              const clean = u.replace(/[.,;:!?)]+$/, "");
+              try {
+                const path = new URL(clean).pathname;
+                if (path && path !== "/" && path.length > 1) crawledUrlSet.add(clean);
+              } catch { /* skip invalid */ }
+              if (crawledUrlSet.size >= 24) break;
+            }
+          }
+          // Always include feed-curated URLs (deep, dated, source-attributed)
+          for (const u of feedEvidence.urls) {
+            crawledUrlSet.add(u);
+            if (crawledUrlSet.size >= 32) break;
+          }
+          // For gallery-only competitors (where we skip live crawling) the
+          // mediaContext still carries `(from <source-page-url>)` markers — pull
+          // those deep article/blog URLs in so the deterministic citation
+          // repair has something to work with.
+          if (mediaContext) {
+            const fromMatches = mediaContext.matchAll(/\(from\s+(https?:\/\/[^)\s]+)\)/g);
+            for (const fm of fromMatches) {
+              const clean = fm[1].replace(/[.,;:!?)]+$/, "");
+              try {
+                const path = new URL(clean).pathname;
+                if (path && path !== "/" && path.length > 1) crawledUrlSet.add(clean);
+              } catch { /* skip */ }
+              if (crawledUrlSet.size >= 48) break;
+            }
+          }
+          // Response contract runs as a non-critical safeStage. If it throws
+          // or times out, the user still gets the (already-finalized) content
+          // and the trace records a failed_soft signal — no more silent crashes
+          // killing the entire response.
+          // stageDiagnostics is hoisted at the top of the try block so the
+          // outer catch can serialize partial progress.
+          const contractStage = await safeStage(
+            "response_contract",
+            () => runResponseContract(
+              content,
+              message || "",
+              {
+                competitor: competitor || "",
+                category,
+                subCategory,
+                crawledUrls: [...crawledUrlSet],
+                evidenceManifest: typeof evidenceManifest !== "undefined" ? evidenceManifest : [],
+                comparisonHostnames: (allCompetitors || [])
+                  .map((c) => c.toLowerCase().replace(/\s+/g, "").replace(/[^a-z0-9-]/g, ""))
+                  .filter((h) => h.length > 1)
+                  .map((h) => `${h}.com`),
+                communityItemsAvailable: feedEvidence.communityItems.length > 0,
               },
-            }).select("id").single();
-            traceId = traceData?.id || null;
-          } catch (traceInsertErr) {
-            console.error("Trace insert error:", traceInsertErr);
+              // Critical path: deterministic repair only (instant). Judge runs
+              // off-path in the background task below so it never gates stream close.
+              { preComputedIntent: queryIntent, skipJudge: true },
+            ),
+            // Inert fallback: keep the finalized content as-is, no scores, no repairs.
+            {
+              final: content,
+              intent: queryIntent,
+              violations: [],
+              repairs: [],
+              repairLog: [],
+              verdict: "skipped" as const,
+              scores: null,
+              judgeFailureReason: "stage_failed_soft",
+            } as unknown as Awaited<ReturnType<typeof runResponseContract>>,
+            { timeoutMs: 120_000 },
+          );
+          stageDiagnostics.push(contractStage.diagnostics);
+          const contractResult = contractStage.value;
+
+          // If repair changed the content, use the repaired version going forward
+          const finalContent = contractResult.final;
+
+          // Pre-generate IDs so the client can finalize its bubble without a
+          // DB round-trip. The server persists both rows in the background.
+          const messageId = crypto.randomUUID();
+          const traceId = crypto.randomUUID();
+
+          // Prose-done signal — fully DECOUPLED from media finalization. This is
+          // what flips `isStreaming=false` on the client (spinner off, action/
+          // feedback row on). It fires immediately after the deterministic
+          // contract (ms), NEVER behind the slow media await. `content` is
+          // prose-only; `media` carries the FAST-phase gallery (gathered before/
+          // during synthesis) so the live gallery is already populated. The full
+          // gallery (slow crawls + on-demand) is reconstructed into the persisted
+          // content by the background task and shows on reload.
+          sendEvent("content", { content: finalContent, messageId, media: mediaItemsForClient });
+          sendEvent("metadata", { traceId });
+          const degradedStages = stageDiagnostics.filter((s) => s.status === "failed_soft").map((s) => s.name);
+          if (degradedStages.length > 0) {
+            sendEvent("metadata", { degradedStages });
           }
+          // Judge scores are no longer computed on the critical path — they are
+          // produced and persisted by the background task below. The Agent Traces
+          // UI / eval chip reads them from the DB once the background write lands.
+          sendEvent("done", {});
 
-          // Run eval + slide summary in parallel, await BOTH before sending done
-          const evalPromise = evaluateResponse(content, competitor, subCategory)
-            .catch((e) => {
-              console.error("Evaluation error:", e);
-              return null;
-            });
+          // Everything below runs after the stream is closed — off the
+          // user's critical path. The browser tab is free.
+          const latencyMs = Date.now() - traceStartTime;
+          queueBackgroundTask((async () => {
+            // 0) MEDIA FINALIZATION (moved off the critical path). Await the slow
+            // media phase (live crawls + quality gate) that ran in parallel with
+            // synthesis, run any on-demand <<NEEDS_MEDIA>> gathers, then build the
+            // canonical "## Visual Overview" and embed it into the PERSISTED
+            // content. This is what reload / doc export / the judge read; the live
+            // client already showed the fast-phase gallery via the `media` channel.
+            // Because this runs AFTER controller.close(), a large gallery quality
+            // gate can never stall the user's stream.
+            if (fullMediaPromise) {
+              try {
+                const fullMedia = await fullMediaPromise;
+                mediaContext = fullMedia.mediaContext;
+                mediaItemsForClient = fullMedia.items;
+                galleryResultsOuter = fullMedia.galleryResults;
+                liveCrawlMetadataOuter = fullMedia.liveCrawlMetadata;
+                for (const m of fullMedia.liveCrawlMetadata) {
+                  if (m.mediaCount > 0) toolCallsLog.push({ tool: "runTargetedLiveCrawl", competitor: m.comp, mediaCount: m.mediaCount });
+                }
+              } catch (e) {
+                console.error("Awaiting full media failed; using fast media:", e);
+              }
+            }
 
-          const slideSummaryPromise = LOVABLE_API_KEY
-            ? buildSlideSummaryPayload(
-                content,
-                `${category || ""} ${subCategory || ""} ${competitor || ""}`.trim(),
-                LOVABLE_API_KEY,
-              ).catch((e) => {
-                console.error("Slide summary generation error:", e);
-                return null;
-              })
-            : Promise.resolve<SlideSummaryPayload | null>(null);
+            // On-demand media (the <<NEEDS_MEDIA: query>> seam), scoped per query.
+            if (needsMediaRequests.length > 0 && allCompetitors.length > 0) {
+              const seen = new Set<string>(mediaItemsForClient.map((i) => mediaDedupeKey(i.url)));
+              const onDemandItems: MediaItemPayload[] = [];
+              const onDemandResults = await Promise.all(
+                needsMediaRequests.map((q) =>
+                  gatherOnDemandMedia(q, allCompetitors, category, subCategory).catch((e) => {
+                    console.error("gatherOnDemandMedia failed:", e);
+                    return { mediaContext: "", items: [] as MediaItemPayload[] };
+                  }),
+                ),
+              );
+              for (const r of onDemandResults) {
+                for (const item of r.items) {
+                  const key = mediaDedupeKey(item.url);
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  onDemandItems.push(item);
+                }
+                if (r.mediaContext) {
+                  mediaContext = mediaContext
+                    ? `${mediaContext}\n--- ON-DEMAND MEDIA ---\n${r.mediaContext}\n--- END ON-DEMAND MEDIA ---`
+                    : r.mediaContext;
+                }
+              }
+              if (onDemandItems.length > 0) {
+                mediaItemsForClient = [...mediaItemsForClient, ...onDemandItems];
+                toolCallsLog.push({ tool: "gatherOnDemandMedia", requests: needsMediaRequests, added: onDemandItems.length });
+              }
+            }
 
-          // Await both with a generous timeout — must complete before function exits
-          const [evalResult, slideSummary] = await Promise.all([
-            Promise.race([
-              evalPromise,
-              new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
-            ]),
-            Promise.race([
-              slideSummaryPromise,
-              new Promise<null>((resolve) => setTimeout(() => resolve(null), 15000)),
-            ]),
-          ]);
+            // Reconstruct the canonical Visual Overview from the final media set
+            // and prepend it to the prose. `persistedContent` is the single
+            // source of truth for media on reload / export / judge.
+            let persistedContent = finalContent;
+            if (mediaContext) {
+              const mediaUrls = [...mediaContext.matchAll(/https?:\/\/[^\s)]+/g)].map((m) => m[0]);
+              const mediaLines = mediaContext.split("\n");
+              const allMediaTokens: string[] = [];
+              const seenUrls = new Set<string>();
+              for (const url of mediaUrls) {
+                const isImageUrl = /\.(?:png|jpe?g|gif|webp|svg)(?:\?|$)/i.test(url) || url.includes("competitor-screenshots");
+                const isVideo = !isImageUrl && (
+                  url.includes("youtube.com/watch") || url.includes("youtu.be/") ||
+                  url.includes("vimeo.com/") || url.includes("wistia.com/") ||
+                  url.includes("vidyard.com/") || url.includes("loom.com/") ||
+                  /\.(?:mp4|webm|mov|ogg)(?:\?|$)/i.test(url)
+                );
+                if (!isImageUrl && !isVideo) continue;
+                const dedupeKey = mediaDedupeKey(url);
+                if (seenUrls.has(dedupeKey)) continue;
+                seenUrls.add(dedupeKey);
+                const refLine = mediaLines.find((l) => l.includes(url));
+                let desc = refLine ? refLine.replace(/\[.*?\]\s*/, "").replace(url, "").replace(/[:\s]+$/, "").trim() : "";
+                const fromMatch = desc.match(/\(from\s+(https?:\/\/[^)]+)\)/);
+                const sourcePageUrl = fromMatch ? fromMatch[1] : "";
+                desc = desc.replace(/\(from[^)]*\)/g, "").trim();
+                desc = desc || `${competitor || allCompetitors[0] || "Competitor"} product`;
+                const token = isVideo
+                  ? `[VIDEO: ${desc}](${url})`
+                  : sourcePageUrl
+                    ? `![${desc}](${url} "${sourcePageUrl}")`
+                    : `![${desc}](${url})`;
+                allMediaTokens.push(token);
+              }
+              allMediaTokens.sort((a, b) => {
+                const aIsCrawled = a.includes("competitor-screenshots") ? 0 : 1;
+                const bIsCrawled = b.includes("competitor-screenshots") ? 0 : 1;
+                return aIsCrawled - bIsCrawled;
+              });
+              if (allMediaTokens.length > 0) {
+                let body = finalContent.replace(/## Visual Overview\s*\n[\s\S]*?(?=\n## )/, "").trim();
+                for (const url of mediaUrls) {
+                  const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                  body = body.replace(new RegExp(`!\\[[^\\]]*\\]\\(${escapedUrl}\\)`, "g"), "");
+                  body = body.replace(new RegExp(escapedUrl, "g"), "");
+                }
+                body = body.replace(/\n{3,}/g, "\n\n").trim();
+                persistedContent = `## Visual Overview\n\n${allMediaTokens.join("\n\n")}\n\n${body}`;
+              }
+            }
 
-          if (traceId) {
+            try {
+              // 1) Persist the assistant message so page reloads see it.
+              await supabaseService.from("chat_messages").insert({
+                id: messageId,
+                thread_id: threadId,
+                user_id: user.id,
+                role: "assistant",
+                content: persistedContent,
+                // Single persisted source of truth for media: the canonical
+                // "## Visual Overview" block embedded in `content`. On reload the
+                // client re-derives the gallery from it (FormattedResponse
+                // content-parse path preserves pageUrl via the image title and the
+                // [VIDEO:] marker). The live `media` SSE channel carried the
+                // fast-phase gallery only — no second persisted copy in metadata.
+                metadata: { trace_id: traceId },
+              });
+            } catch (e) { console.error("chat_messages insert error:", e); }
+
+            try {
+              // 2) Trace row.
+              await supabaseService.from("agent_traces").insert({
+                id: traceId,
+                message_id: messageId,
+                user_id: user.id, thread_id: threadId || null, category, sub_category: subCategory,
+                competitor_name: competitor, system_prompt: systemPrompt, user_prompt: message,
+                retrieved_documents: retrievedDocs, tool_calls: toolCallsLog,
+                raw_llm_output: content, formatted_output: persistedContent,
+                model_used: modelUsed,
+                latency_ms: latencyMs, prompt_tokens: usage.prompt_tokens || null,
+                completion_tokens: usage.completion_tokens || null, total_tokens: usage.total_tokens || null,
+                status: "completed", trace_type: "conversation", agent_source: "comp_agent",
+                metadata: {
+                  slide_summary_status: "pending",
+                  slide_summary_model: SLIDE_SUMMARY_MODEL,
+                  contract_intent: contractResult.intent,
+                  contract_violations: contractResult.violations,
+                  contract_repairs: contractResult.repairs,
+                  contract_repair_log: contractResult.repairLog,
+                  contract_verdict: contractResult.verdict,
+                  contract_repair_ms: contractResult.repairMs,
+                  contract_judge_ms: contractResult.judgeMs,
+                  judge_failure_reason: contractResult.judgeFailureReason,
+                  live_crawl_triggered: liveCrawlMetadataOuter.length > 0,
+                  live_crawl_reason: liveCrawlMetadataOuter.length > 0 ? "narrow_intent_gallery_miss" : null,
+                  live_crawl_details: liveCrawlMetadataOuter,
+                  gallery_filtered: (galleryResultsOuter || []).reduce((sum, g) => sum + (g.droppedOffTopic || 0), 0),
+                  feed_news_count: feedEvidence.newsItems.length,
+                  feed_community_count: feedEvidence.communityItems.length,
+                  pipeline: {
+                    requestId: crypto.randomUUID(),
+                    checkpoint: "finalization_complete",
+                    stages: stageDiagnostics,
+                    finalize: finalizeDiag ?? null,
+                    pipeline_version: "v2",
+                    source_count: registry.list().length,
+                  } as PipelineDiagnostics & Record<string, unknown>,
+                },
+              });
+            } catch (traceInsertErr) { console.error("Trace insert error:", traceInsertErr); }
+
+            // 3) Slide summary (still bounded by safeStage 120s).
+            let slideSummary: SlideSummaryPayload | null = null;
+            let slideSummaryError: string | null = null;
+            if (LOVABLE_API_KEY) {
+              const slideStage = await safeStage(
+                "slide_summary",
+                () => buildSlideSummaryPayload(
+                  persistedContent,
+                  `${category || ""} ${subCategory || ""} ${competitor || ""}`.trim(),
+                  LOVABLE_API_KEY,
+                ),
+                null as SlideSummaryPayload | null,
+                { timeoutMs: 120_000 },
+              );
+              slideSummary = slideStage.value;
+              if (slideStage.degraded) slideSummaryError = slideStage.diagnostics.error ?? "stage_failed_soft";
+            }
+
+            // 3.5) Judge — off the critical path. Single source of truth for
+            // eval-score persistence (replaces the deleted client-side write).
+            let evalResult: Awaited<ReturnType<typeof judgeResponse>>["scores"] = null;
+            let judgeFailureReason: string | null = null;
+            let judgeMs = 0;
+            try {
+              // Judge the analytical body, not the gallery-prepended blob. The
+              // "## Visual Overview" gallery is gathered + quality-gated by the
+              // separate media pipeline; leaving it in the judged text makes the
+              // LLM judge grade a wall of (often one-sided) screenshots instead of
+              // the comparison prose, which structurally tanks the score. Strip the
+              // leading Visual Overview block so the judge scores the actual answer.
+              const contentForJudge = persistedContent
+                .replace(/## Visual Overview\s*\n[\s\S]*?(?=\n## )/, "")
+                .trim();
+              const judged = await judgeResponse(contentForJudge, competitor || "", subCategory, contractResult.intent);
+              evalResult = judged.scores;
+              judgeFailureReason = judged.failureReason;
+              judgeMs = judged.judgeMs;
+            } catch (e) {
+              judgeFailureReason = e instanceof Error ? e.message : String(e);
+            }
+
+            // 3.6) Persist evaluation_scores server-side (single source of truth).
+            if (evalResult) {
+              try {
+                await supabaseService.from("evaluation_scores").insert({
+                  user_id: user.id, category, sub_category: subCategory,
+                  competitor_name: competitor, message_id: messageId,
+                  factual_correctness: evalResult.factual_correctness?.score ?? null,
+                  structural_clarity: evalResult.structural_clarity?.score ?? null,
+                  depth_of_comparison: evalResult.depth_of_comparison?.score ?? null,
+                  visual_evidence: evalResult.visual_evidence?.score ?? null,
+                  citation_coverage: evalResult.citation_coverage?.score ?? null,
+                  overall_score: evalResult.overall_score ?? null,
+                });
+              } catch (e) { console.error("evaluation_scores insert error:", e); }
+            }
+
+            // 4) Update trace with slide summary + judge scores.
             const judgeScores = evalResult ? {
               factual_correctness: evalResult.factual_correctness,
               structural_clarity: evalResult.structural_clarity,
@@ -2659,58 +1768,73 @@ IMPORTANT: Never expose internal adaptive planning data or proprietary informati
               media_quality: evalResult.media_quality,
               overall_summary: evalResult.overall_summary,
               improvement_suggestions: evalResult.improvement_suggestions,
+              weights_used: (evalResult as any).weights_used,
             } : {};
-
             const slideMetadata = slideSummary
-              ? {
-                  slide_summary_status: "ready",
-                  slide_summary_model: slideSummary.model,
-                  slide_summary_version: slideSummary.version,
-                  slide_summary_generated_at: slideSummary.generated_at,
-                  slide_section_summaries: slideSummary.sections,
-                  slide_summary_lookup: slideSummary.lookup,
-                }
-              : {
-                  slide_summary_status: "failed",
-                  slide_summary_model: "openai/gpt-5-nano",
-                };
-
+              ? { slide_summary_status: "ready", slide_summary_model: slideSummary.model, slide_summary_version: slideSummary.version, slide_summary_generated_at: slideSummary.generated_at, slide_section_summaries: slideSummary.sections, slide_summary_lookup: slideSummary.lookup, slide_summary_diagnostics: slideSummary.diagnostics, slide_summary_error: null }
+              : { slide_summary_status: "failed", slide_summary_model: SLIDE_SUMMARY_MODEL, slide_summary_error: slideSummaryError || "unknown" };
             try {
               await supabaseService.from("agent_traces").update({
                 judge_scores: judgeScores,
-                overall_score: evalResult?.overall_score || null,
-                metadata: slideMetadata,
+                overall_score: evalResult?.overall_score ?? null,
+                metadata: {
+                  ...slideMetadata,
+                  contract_intent: contractResult.intent,
+                  contract_violations: contractResult.violations,
+                  contract_repairs: contractResult.repairs,
+                  contract_repair_log: contractResult.repairLog,
+                  contract_verdict: contractResult.verdict,
+                  contract_repair_ms: contractResult.repairMs,
+                  contract_judge_ms: judgeMs,
+                  judge_failure_reason: judgeFailureReason,
+                  judge_weights_used: (evalResult as any)?.weights_used ?? null,
+                  live_crawl_triggered: liveCrawlMetadataOuter.length > 0,
+                  live_crawl_reason: liveCrawlMetadataOuter.length > 0 ? "narrow_intent_gallery_miss" : null,
+                  live_crawl_details: liveCrawlMetadataOuter,
+                  gallery_filtered: (galleryResultsOuter || []).reduce((sum, g) => sum + (g.droppedOffTopic || 0), 0),
+                  pipeline: {
+                    requestId: crypto.randomUUID(),
+                    checkpoint: "persistence_complete",
+                    stages: stageDiagnostics,
+                    finalize: finalizeDiag ?? null,
+                    pipeline_version: "v2",
+                    source_count: registry.list().length,
+                    degraded: stageDiagnostics.some((s) => s.status === "failed_soft"),
+                  },
+                },
               }).eq("id", traceId).eq("user_id", user.id);
-            } catch (updateErr) {
-              console.error("Trace update error:", updateErr);
-            }
-          }
-
-          sendEvent("metadata", {
-            evalScores: evalResult,
-            traceId,
-          });
-
-          sendEvent("done", {});
+            } catch (updateErr) { console.error("Trace update error:", updateErr); }
+          })());
         } catch (innerErr) {
-          console.error("Stream error:", innerErr);
+          const errStack = innerErr instanceof Error ? (innerErr.stack ?? "") : "";
+          const errName = innerErr instanceof Error ? innerErr.name : "UnknownError";
+          const errMsg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+          console.error("[chat-analysis:stream-error]", errName, errMsg, "\nSTACK:\n", errStack);
           try {
             const errEvent = `event: error\ndata: ${JSON.stringify({ content: "An error occurred processing your request." })}\n\n`;
             controller.enqueue(encoder.encode(errEvent));
-          } catch { /* closed */ }
+          } catch {}
 
           try {
             supabaseService.from("agent_traces").insert({
               user_id: user.id, category: "unknown", sub_category: "unknown",
-                      status: "error", error_message: String(innerErr),
-                      latency_ms: Date.now() - traceStartTime,
-                      tool_calls: toolCallsLog, retrieved_documents: retrievedDocs,
-                      trace_type: 'conversation', agent_source: 'comp_agent',
-            }).then(() => {}).catch(() => {});
-          } catch { /* swallow */ }
+              status: "error", error_message: `${errName}: ${errMsg}`,
+              latency_ms: Date.now() - traceStartTime,
+              tool_calls: toolCallsLog, retrieved_documents: retrievedDocs,
+              trace_type: 'conversation', agent_source: 'comp_agent',
+              metadata: {
+                error_name: errName,
+                error_message: errMsg,
+                error_stack: errStack.slice(0, 8000),
+                stage_diagnostics: stageDiagnostics,
+                last_completed_stage: stageDiagnostics.length > 0 ? stageDiagnostics[stageDiagnostics.length - 1].name : null,
+                last_entered_stage: lastEnteredStage,
+              },
+            }).then(() => {}, () => {});
+          } catch {}
         } finally {
           clearInterval(keepalive);
-          try { controller.close(); } catch { /* already closed */ }
+          try { controller.close(); } catch {}
         }
       },
     });

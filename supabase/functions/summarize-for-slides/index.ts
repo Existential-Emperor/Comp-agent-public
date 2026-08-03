@@ -1,4 +1,17 @@
+import { requireAuth } from "../_shared/auth.ts";
+// Slide-bullet summarizer used by the client PPTX export path
+// (src/lib/export-utils.ts). Delegates to the shared
+// buildSlideSummaryPayload helper so trace-time and export-time slide
+// generation share one model (gpt-5.2 strict), one chunking strategy,
+// one set of timeouts, and one diagnostics shape.
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import {
+  buildSlideSummaryPayload,
+  cleanSlideBullet,
+  SLIDE_SUMMARY_MODEL,
+  type SlideSummaryPayload,
+} from "../_shared/slide-summary.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -6,111 +19,88 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type",
 };
 
+/**
+ * The export caller sends a flat list of bullets; the shared helper expects
+ * a markdown blob with `## Heading` + `- bullet` structure. We synthesize
+ * minimal markdown from the input list, then flatten the resulting section
+ * summaries back into a single in-order array to preserve the existing
+ * `{ status, summaries }` contract.
+ */
+function bulletsToMarkdown(bullets: string[]): string {
+  return ["## Slide Bullets", ...bullets.map((b) => `- ${b.replace(/\s+/g, " ").trim()}`)].join("\n");
+}
+
+function flattenSummaries(payload: SlideSummaryPayload, originalCount: number): string[] {
+  const flat: string[] = [];
+  for (const section of payload.sections) {
+    for (const summary of section.summaries) flat.push(summary);
+  }
+  return flat.slice(0, originalCount);
+}
+
 serve(async (req) => {
-  if (req.method === "OPTIONS")
-    return new Response(null, { headers: corsHeaders });
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  // --- Auth guard (shared): valid user JWT or service-role key required ---
+  const authError = await requireAuth(req, corsHeaders);
+  if (authError) return authError;
 
   try {
     const { bullets, context } = await req.json();
 
     if (!Array.isArray(bullets) || bullets.length === 0) {
       return new Response(
-        JSON.stringify({ summaries: [] }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        JSON.stringify({ status: "ready", summaries: [], model: SLIDE_SUMMARY_MODEL }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
 
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY not configured");
 
-    // Build numbered list for the AI to summarize
-    const numberedBullets = bullets
-      .map((b: string, i: number) => `[${i + 1}] ${b}`)
-      .join("\n");
+    const markdown = bulletsToMarkdown(bullets as string[]);
+    const payload = await buildSlideSummaryPayload(markdown, context || "", LOVABLE_API_KEY);
 
-    const systemPrompt = `You are a presentation content editor. Your job is to transform verbose analysis bullets into concise, slide-ready summaries.
-
-Rules:
-- Each summary must capture the FULL meaning of the original bullet — not just the first sentence
-- Distill the key insight, finding, or recommendation into 2-3 clear sentences
-- Maximum 500 characters per summary
-- Remove all markdown formatting, links, and citations
-- Use active voice and strong verbs
-- Do NOT add new information — only summarize what's given
-- Do NOT truncate or cut off mid-sentence — every summary must end with a complete thought
-- Maintain the same numbered order as input
-- Return ONLY a JSON array of strings, one per input bullet
-- The array must have exactly ${bullets.length} items`;
-
-    const userPrompt = `${context ? `Context: ${context}\n\n` : ""}Summarize each bullet for a presentation slide:\n\n${numberedBullets}`;
-
-    const response = await fetch(
-      "https://ai.gateway.lovable.dev/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${LOVABLE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "openai/gpt-5-nano",
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          max_completion_tokens: 4096,
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("AI gateway error:", response.status, errText);
-      // Fallback: return original bullets trimmed
+    if (!payload) {
+      // No sections were parsed — fall back to deterministic clean text so
+      // the export still produces usable slides.
       return new Response(
         JSON.stringify({
-          summaries: bullets.map((b: string) => {
-          const clean = b.replace(/\*\*/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").trim();
-            return clean;
-          }),
+          status: "failed",
+          error: "no_sections_parsed",
+          model: SLIDE_SUMMARY_MODEL,
+          summaries: (bullets as string[]).map((b) => cleanSlideBullet(b)),
         }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
 
-    const data = await response.json();
-    const rawContent = data.choices?.[0]?.message?.content || "[]";
+    const summaries = flattenSummaries(payload, bullets.length);
 
-    // Extract JSON array from response (handle markdown code fences)
-    const jsonMatch = rawContent.match(/\[[\s\S]*\]/);
-    let summaries: string[];
-    try {
-      summaries = JSON.parse(jsonMatch?.[0] || "[]");
-    } catch {
-      // Fallback parse: split by newlines
-      summaries = rawContent
-        .split("\n")
-        .map((l: string) => l.replace(/^\d+[\.\)]\s*/, "").replace(/^["']|["']$/g, "").trim())
-        .filter((l: string) => l.length > 5);
-    }
-
-    // Ensure we have the right count, pad/trim as needed
+    // Pad with deterministic fallbacks if the helper trimmed input above MAX_BULLETS.
     while (summaries.length < bullets.length) {
-      const idx = summaries.length;
-      const fallback = bullets[idx].replace(/\*\*/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").trim();
-      summaries.push(fallback);
+      summaries.push(cleanSlideBullet(bullets[summaries.length] as string));
     }
-    summaries = summaries.slice(0, bullets.length);
 
     return new Response(
-      JSON.stringify({ summaries }),
-      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      JSON.stringify({
+        status: "ready",
+        summaries,
+        model: payload.model,
+        version: payload.version,
+        diagnostics: payload.diagnostics,
+      }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   } catch (e) {
     console.error("summarize-for-slides error:", e);
     return new Response(
-      JSON.stringify({ error: e instanceof Error ? e.message : "Unknown error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      JSON.stringify({
+        status: "failed",
+        error: e instanceof Error ? e.message : "Unknown error",
+        model: SLIDE_SUMMARY_MODEL,
+      }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   }
 });

@@ -9,13 +9,15 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { MessageSquare, ExternalLink, Newspaper, MessageCircle, ChevronDown, ChevronUp, Sparkles, TrendingUp, AlertTriangle, Zap, X, UserCircle, LogOut, Camera, Loader2, Bookmark } from "lucide-react";
+import { MessageSquare, ExternalLink, Newspaper, MessageCircle, ChevronDown, ChevronUp, Sparkles, TrendingUp, AlertTriangle, Zap, X, UserCircle, LogOut, Camera, Loader2, Bookmark, MessageSquarePlus, ImagePlus } from "lucide-react";
 import { useBotAvatar } from "@/hooks/useBotAvatar";
 import { format } from "date-fns";
 import NewsChatPanel from "@/components/NewsChatPanel";
+import { armNotificationPermission } from "@/hooks/useCompletionNotification";
 import { motion } from "framer-motion";
 import { staggerContainer, staggerItem, headerVariants, fadeInUp } from "@/lib/animations";
 import { createPortal } from "react-dom";
+import { useToast } from "@/hooks/use-toast";
 
 interface NewsItem {
   id: string;
@@ -127,10 +129,10 @@ const NewsCard = ({ item, isSaved, onSave, onUnsave }: { item: NewsItem; isSaved
           )}
           <button
             onClick={handleSave}
-            className={`absolute right-3 top-3 h-8 w-8 rounded-full flex items-center justify-center transition-all ${
+            className={`absolute right-3 top-3 h-8 w-8 rounded-full flex items-center justify-center transition-all border ${
               isSaved
-                ? "bg-primary text-primary-foreground"
-                : "bg-background/70 text-muted-foreground hover:bg-background hover:text-primary"
+                ? "bg-primary text-primary-foreground border-primary"
+                : "bg-background/70 text-foreground border-border/60 hover:bg-primary hover:text-primary-foreground hover:border-primary"
             }`}
             title={isSaved ? "Unsave item" : "Save item"}
           >
@@ -187,7 +189,6 @@ const CommunityCard = ({ item, isSaved, onSave, onUnsave }: { item: NewsItem; is
                 {item.source_name}
               </span>
             )}
-            <span>{formatDate(item.published_at || item.fetched_at) || "Recent"}</span>
             <ExternalLink className="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity" />
           </div>
         </div>
@@ -296,7 +297,7 @@ const CompetitorMultiSelect = ({
         <Button
           variant="outline"
           size="sm"
-          className="h-8 w-[160px] justify-between text-xs font-normal"
+          className="h-8 w-[160px] justify-between text-xs font-normal text-foreground hover:text-foreground hover:bg-primary/15 hover:border-primary/50"
         >
           <span className="truncate">{label}</span>
           <ChevronDown className="ml-1 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -362,9 +363,68 @@ const NewsLanding = () => {
   const navigate = useNavigate();
   const { user, signOut } = useAuth();
   const { avatarUrl, setAvatarUrl } = useUserAvatar();
+  const { toast } = useToast();
   const [profileOpen, setProfileOpen] = useState(false);
   const [avatarUploading, setAvatarUploading] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+
+  // Share Feedback state
+  const [feedbackDialogOpen, setFeedbackDialogOpen] = useState(false);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackImages, setFeedbackImages] = useState<{ file: File; preview: string }[]>([]);
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const feedbackImageInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFeedbackImageAdd = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    const newImages = files.filter(f => f.type.startsWith("image/")).map(file => ({
+      file,
+      preview: URL.createObjectURL(file),
+    }));
+    setFeedbackImages(prev => [...prev, ...newImages]);
+    if (feedbackImageInputRef.current) feedbackImageInputRef.current.value = "";
+  };
+
+  const handleFeedbackImageRemove = (index: number) => {
+    setFeedbackImages(prev => {
+      URL.revokeObjectURL(prev[index].preview);
+      return prev.filter((_, i) => i !== index);
+    });
+  };
+
+  const handleFeedbackSubmit = async () => {
+    if (!user || feedbackText.trim().length < 3) return;
+    setFeedbackSubmitting(true);
+    try {
+      const imageUrls: string[] = [];
+      for (const img of feedbackImages) {
+        const ext = img.file.name.split(".").pop() || "png";
+        const path = `${user.id}/feedback/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const { error: uploadErr } = await supabase.storage.from("avatars").upload(path, img.file, { upsert: false });
+        if (!uploadErr) {
+          const { data: pubUrl } = supabase.storage.from("avatars").getPublicUrl(path);
+          imageUrls.push(pubUrl.publicUrl);
+        }
+      }
+
+      await supabase.from("user_feedback").insert({
+        user_id: user.id,
+        username: user.email || "",
+        feedback_text: feedbackText.trim(),
+        image_urls: imageUrls,
+      });
+
+      toast({ title: "Feedback submitted", description: "Thank you for your feedback!" });
+      setFeedbackDialogOpen(false);
+      setFeedbackText("");
+      feedbackImages.forEach(img => URL.revokeObjectURL(img.preview));
+      setFeedbackImages([]);
+    } catch (err: any) {
+      toast({ title: "Failed to submit", description: err.message || "Please try again.", variant: "destructive" });
+    } finally {
+      setFeedbackSubmitting(false);
+    }
+  };
 
   const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -395,7 +455,7 @@ const NewsLanding = () => {
   const [newsExpanded, setNewsExpanded] = useState(false);
   const [communityExpanded, setCommunityExpanded] = useState(false);
   const [newsTimeRange, setNewsTimeRange] = useState<TimeRange>("31");
-  const [communityTimeRange, setCommunityTimeRange] = useState<TimeRange>("31");
+  
   const [newsCompetitors, setNewsCompetitors] = useState<string[]>([]);
   const [communityCompetitors, setCommunityCompetitors] = useState<string[]>([]);
   const [savedItemIds, setSavedItemIds] = useState<Set<string>>(new Set());
@@ -406,7 +466,6 @@ const NewsLanding = () => {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatPrompt, setChatPrompt] = useState<string | null>(null);
   const [chatSectionLabel, setChatSectionLabel] = useState("News");
-  const [chatNewsContext, setChatNewsContext] = useState("");
 
   // Load saved item IDs
   useEffect(() => {
@@ -450,8 +509,8 @@ const NewsLanding = () => {
 
   // Fetch items based on the max time range needed
   const maxDays = useMemo(() => {
-    return Math.max(parseInt(newsTimeRange), parseInt(communityTimeRange));
-  }, [newsTimeRange, communityTimeRange]);
+    return parseInt(newsTimeRange);
+  }, [newsTimeRange]);
 
   useEffect(() => {
     const fetchItems = async () => {
@@ -474,30 +533,15 @@ const NewsLanding = () => {
     fetchItems();
   }, [maxDays]);
 
-  // Trigger fetch-news for extended time ranges (quarter/year) — always fetch and re-query
+  // Extended time range: just re-query the DB (no user-triggered fetches — cron handles it)
   const [fetchingExtended, setFetchingExtended] = useState(false);
   useEffect(() => {
-    const days = Math.max(parseInt(newsTimeRange), parseInt(communityTimeRange));
-    if (days <= 31) return; // Only trigger for quarter/year
+    const days = parseInt(newsTimeRange);
+    if (days <= 31) return;
 
-    const triggerExtendedFetch = async () => {
+    const refetchFromDb = async () => {
       setFetchingExtended(true);
       try {
-        const session = await supabase.auth.getSession();
-        const token = session.data.session?.access_token;
-        if (!token) return;
-
-        await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/fetch-news`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-            apikey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-          },
-          body: JSON.stringify({ force: true, days }),
-        });
-
-        // Re-fetch items after crawl completes
         const cutoff = new Date();
         cutoff.setDate(cutoff.getDate() - days);
         const { data } = await supabase
@@ -510,13 +554,13 @@ const NewsLanding = () => {
           setAllItems(data as unknown as NewsItem[]);
         }
       } catch {
-        // Silently fail - best effort
+        // Silently fail
       } finally {
         setFetchingExtended(false);
       }
     };
-    triggerExtendedFetch();
-  }, [newsTimeRange, communityTimeRange]);
+    refetchFromDb();
+  }, [newsTimeRange]);
 
   const SOCIAL_PLATFORMS = ["Reddit", "LinkedIn", "X/Twitter", "YouTube", "Quora", "Facebook"];
 
@@ -601,20 +645,34 @@ const NewsLanding = () => {
   };
 
   const newsItems = useMemo(() => {
-    const byType = allItems.filter((i) => i.item_type === "news" && !isSocialMediaUrl(i.source_url) && !isAdaptivePlanning(i));
+    const byType = allItems.filter((i) => i.item_type === "news" && !isSocialMediaUrl(i.source_url));
     const byCompetitor = filterByCompetitors(byType, newsCompetitors);
     return filterByTimeRange(byCompetitor, newsTimeRange);
   }, [allItems, newsTimeRange, newsCompetitors]);
 
+  // Community items: show ALL regardless of time range, only filter by competitor
+  const [allCommunityItems, setAllCommunityItems] = useState<NewsItem[]>([]);
+  useEffect(() => {
+    const fetchAllCommunity = async () => {
+      const { data } = await supabase
+        .from("news_items")
+        .select("*")
+        .order("published_at", { ascending: false, nullsFirst: false })
+        .limit(1000);
+      if (data) {
+        const community = (data as unknown as NewsItem[]).filter((i) =>
+          (i.item_type === "community" || isSocialMediaUrl(i.source_url)) &&
+          !isOfficialCompetitorPost(i.source_url)
+        );
+        setAllCommunityItems(community);
+      }
+    };
+    fetchAllCommunity();
+  }, []);
+
   const communityItems = useMemo(() => {
-    const byType = allItems.filter((i) =>
-      (i.item_type === "community" || isSocialMediaUrl(i.source_url)) &&
-      !isAdaptivePlanning(i) &&
-      !isOfficialCompetitorPost(i.source_url)
-    );
-    const byCompetitor = filterByCompetitors(byType, communityCompetitors);
-    return filterByTimeRange(byCompetitor, communityTimeRange);
-  }, [allItems, communityTimeRange, communityCompetitors]);
+    return filterByCompetitors(allCommunityItems, communityCompetitors);
+  }, [allCommunityItems, communityCompetitors]);
 
   const newsDefaultCount = DEFAULT_ROWS * ITEMS_PER_ROW_NEWS;
   const communityDefaultCount = DEFAULT_ROWS * ITEMS_PER_ROW_COMMUNITY;
@@ -627,14 +685,40 @@ const NewsLanding = () => {
 
   const timeRangeLabel = (range: TimeRange) => TIME_RANGE_OPTIONS.find((o) => o.value === range)?.label || "";
 
+  const describeChatScope = (section: string) => {
+    if (section === "News") {
+      return `Section: News. Time range: ${timeRangeLabel(newsTimeRange)}. Competitor filter: ${newsCompetitors.length > 0 ? newsCompetitors.join(", ") : "All competitors"}. In-scope filtered items: ${newsItems.length}. Answer strictly from the provided filtered feed items.`;
+    }
+
+    if (section === "Community") {
+      return `Section: Community. Competitor filter: ${communityCompetitors.length > 0 ? communityCompetitors.join(", ") : "All competitors"}. In-scope filtered items: ${communityItems.length}. Answer strictly from the provided filtered feed items.`;
+    }
+
+    return `Section: Full Feed. News time range: ${timeRangeLabel(newsTimeRange)}. News competitor filter: ${newsCompetitors.length > 0 ? newsCompetitors.join(", ") : "All competitors"}. Community competitor filter: ${communityCompetitors.length > 0 ? communityCompetitors.join(", ") : "All competitors"}. In-scope filtered items: ${newsItems.length + communityItems.length}. Answer strictly from the provided filtered feed items.`;
+  };
+
+  const activeChatContext = useMemo(() => {
+    if (chatSectionLabel === "News") return buildNewsContext(newsItems);
+    if (chatSectionLabel === "Community") return buildNewsContext(communityItems);
+    return buildNewsContext([...newsItems, ...communityItems]);
+  }, [chatSectionLabel, newsItems, communityItems]);
+
+  const activeChatScope = useMemo(() => describeChatScope(chatSectionLabel), [
+    chatSectionLabel,
+    newsTimeRange,
+    newsCompetitors,
+    communityCompetitors,
+    newsItems,
+    communityItems,
+  ]);
+
   const competitorFilterLabel = (competitors: string[]) => {
     if (competitors.length === 0) return "";
     return competitors.join(", ") + " ";
   };
 
-  const openChatWithPrompt = (prompt: string, section: "News" | "Community", items: NewsItem[]) => {
-    const context = buildNewsContext(items);
-    setChatNewsContext(context);
+  const openChatWithPrompt = (prompt: string, section: "News" | "Community") => {
+    void armNotificationPermission();
     setChatSectionLabel(section);
     setChatPrompt(prompt);
     setChatOpen(true);
@@ -662,7 +746,7 @@ const NewsLanding = () => {
     {
       label: "Summarize discussions",
       icon: <Sparkles className="h-3 w-3" />,
-      prompt: `Summarize the key community discussions and social posts from the ${timeRangeLabel(communityTimeRange).toLowerCase()}${communityCompetitors.length > 0 ? ` about ${communityCompetitors.join(", ")}` : ""}. What are users talking about?`,
+      prompt: `Summarize the key community discussions and social posts${communityCompetitors.length > 0 ? ` about ${communityCompetitors.join(", ")}` : ""}. What are users talking about?`,
     },
     {
       label: "Sentiment analysis",
@@ -677,31 +761,42 @@ const NewsLanding = () => {
   ];
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="relative z-10 flex h-dvh overflow-hidden">
+      {/* Left column: scrollable feed (independent from chat panel viewport) */}
+      <div
+        className={`flex-1 min-w-0 h-dvh overflow-y-auto transition-[margin] duration-300 ${chatOpen ? "mr-[28rem]" : ""}`}
+      >
       {/* Header */}
       <motion.header
-        className={`sticky top-0 z-50 border-b border-border bg-background/80 backdrop-blur-md transition-all ${chatOpen ? "mr-[28rem]" : ""}`}
+        className="sticky top-0 z-40 border-b border-border/60 bg-background/30 backdrop-blur-xl"
         variants={headerVariants}
         initial="initial"
         animate="animate"
       >
         <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6">
-          <div className="flex items-center gap-2">
-            <Newspaper className="h-5 w-5 text-primary" />
-            <span className="text-sm font-bold tracking-tight text-foreground">Comp Intel Feed</span>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => navigate("/")}
+              className="text-signal text-xl font-bold tracking-[0.18em] uppercase leading-none transition-opacity hover:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 rounded-sm"
+              aria-label="Go to Feed home"
+            >
+              Sentinel
+            </button>
+            <span className="h-6 w-px bg-border" aria-hidden="true" />
+            <span className="text-xl font-bold tracking-tight text-foreground drop-shadow-[0_0_12px_hsl(var(--primary)/0.35)]">Feed</span>
           </div>
           <div className="flex items-center gap-2">
             <Button
               onClick={() => {
-                const allContext = buildNewsContext([...newsItems, ...communityItems]);
-                setChatNewsContext(allContext);
+                void armNotificationPermission();
                 setChatSectionLabel("Feed");
                 setChatPrompt(null);
                 setChatOpen(true);
               }}
               size="sm"
               variant="outline"
-              className="gap-2 border-primary/30 text-primary hover:bg-primary/10"
+              className="gap-2 border-primary/30 text-primary hover:bg-primary/15 hover:text-primary hover:border-primary/60"
             >
               <Zap className="h-4 w-4" />
               Feed Agent
@@ -728,6 +823,10 @@ const NewsLanding = () => {
                 <DropdownMenuItem onClick={() => navigate("/saved")}>
                   <Bookmark className="mr-2 h-4 w-4" />
                   Saved Items
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setFeedbackDialogOpen(true)}>
+                  <MessageSquarePlus className="mr-2 h-4 w-4" />
+                  Share Feedback
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={signOut}>
                   <LogOut className="mr-2 h-4 w-4" />
@@ -791,7 +890,57 @@ const NewsLanding = () => {
         </DialogContent>
       </Dialog>
 
-      <main className={`mx-auto max-w-7xl px-4 py-8 sm:px-6 space-y-12 transition-all ${chatOpen ? "mr-[28rem]" : ""}`}>
+      {/* Share Feedback dialog */}
+      <Dialog open={feedbackDialogOpen} onOpenChange={(open) => {
+        setFeedbackDialogOpen(open);
+        if (!open) { setFeedbackText(""); feedbackImages.forEach(img => URL.revokeObjectURL(img.preview)); setFeedbackImages([]); }
+      }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Share Feedback</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-muted-foreground">Attachments (optional)</label>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" className="gap-1.5 text-xs" onClick={() => feedbackImageInputRef.current?.click()}>
+                  <ImagePlus className="h-3.5 w-3.5" />
+                  Add Images
+                </Button>
+                <input ref={feedbackImageInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleFeedbackImageAdd} />
+              </div>
+              {feedbackImages.length > 0 && (
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {feedbackImages.map((img, idx) => (
+                    <div key={idx} className="relative group">
+                      <img src={img.preview} alt={`Attachment ${idx + 1}`} className="h-16 w-16 rounded-md object-cover border border-border" />
+                      <button onClick={() => handleFeedbackImageRemove(idx)} className="absolute -top-1.5 -right-1.5 h-5 w-5 rounded-full bg-destructive text-destructive-foreground flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-muted-foreground">Feedback *</label>
+              <textarea value={feedbackText} onChange={(e) => setFeedbackText(e.target.value)} placeholder="Tell us what you think..." className="w-full min-h-[120px] rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 resize-none" rows={5} />
+              {feedbackText.length > 0 && feedbackText.trim().length < 3 && (
+                <p className="text-xs text-destructive">Please enter at least 3 characters</p>
+              )}
+            </div>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setFeedbackDialogOpen(false)} disabled={feedbackSubmitting}>Cancel</Button>
+            <Button onClick={handleFeedbackSubmit} disabled={feedbackSubmitting || feedbackText.trim().length < 3}>
+              {feedbackSubmitting ? <Loader2 className="h-4 w-4 animate-spin mr-1.5" /> : null}
+              Submit
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 space-y-12">
         {loading ? (
           <div className="flex items-center justify-center py-20">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
@@ -825,7 +974,7 @@ const NewsLanding = () => {
               {newsItems.length > 0 && (
                 <SectionPromptChips
                   chips={newsChips}
-                  onChipClick={(prompt) => openChatWithPrompt(prompt, "News", newsItems)}
+                  onChipClick={(prompt) => openChatWithPrompt(prompt, "News")}
                 />
               )}
               {newsItems.length === 0 ? (
@@ -873,27 +1022,18 @@ const NewsLanding = () => {
                     competitorNames={competitorNames}
                     onChange={(v) => { setCommunityCompetitors(v); setCommunityExpanded(false); }}
                   />
-                  <Tabs value={communityTimeRange} onValueChange={(v) => { setCommunityTimeRange(v as TimeRange); setCommunityExpanded(false); }}>
-                    <TabsList className="h-8">
-                      {TIME_RANGE_OPTIONS.map((opt) => (
-                        <TabsTrigger key={opt.value} value={opt.value} className="text-xs px-2.5 py-1">
-                          {opt.label}
-                        </TabsTrigger>
-                      ))}
-                    </TabsList>
-                  </Tabs>
                 </div>
               </div>
               {communityItems.length > 0 && (
                 <SectionPromptChips
                   chips={communityChips}
-                  onChipClick={(prompt) => openChatWithPrompt(prompt, "Community", communityItems)}
+                  onChipClick={(prompt) => openChatWithPrompt(prompt, "Community")}
                 />
               )}
               {communityItems.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-border bg-card/50 p-12 text-center">
                   <MessageCircle className="mx-auto mb-3 h-10 w-10 text-muted-foreground/40" />
-                  <p className="text-sm text-muted-foreground">No community posts found for this time range.</p>
+                  <p className="text-sm text-muted-foreground">No community posts found.</p>
                 </div>
               ) : (
                 <>
@@ -926,14 +1066,17 @@ const NewsLanding = () => {
       </main>
 
       <SaveFlyAnimation animPos={flyAnimationPos} onComplete={() => setFlyAnimationPos(null)} />
+      </div>
 
-      {/* Chat Panel */}
+      {/* Chat Panel — fixed-position sibling so its viewport is independent from the feed scroll */}
       <NewsChatPanel
         open={chatOpen}
         onClose={() => setChatOpen(false)}
         initialPrompt={chatPrompt}
-        newsContext={chatNewsContext}
+        newsContext={activeChatContext}
+        feedScope={activeChatScope}
         sectionLabel={chatSectionLabel}
+        feedCompetitorFilter={chatSectionLabel === "News" ? newsCompetitors : chatSectionLabel === "Community" ? communityCompetitors : [...new Set([...newsCompetitors, ...communityCompetitors])]}
       />
     </div>
   );

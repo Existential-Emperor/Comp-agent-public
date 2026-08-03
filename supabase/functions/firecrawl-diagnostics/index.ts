@@ -1,4 +1,4 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { requireAuth } from "../_shared/auth.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -16,6 +16,10 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  // --- Auth guard (shared): valid user JWT or service-role key required ---
+  const authError = await requireAuth(req, corsHeaders);
+  if (authError) return authError;
 
   // --- Test 1: Key presence check ---
   const keyStatus = KEY_ENV_NAMES.map((envName) => {

@@ -1,7 +1,9 @@
-import React, { useState, useCallback, useEffect } from "react";
+import React, { useState, useCallback, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { X, Play, ExternalLink, ChevronLeft, ChevronRight } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { overlayVariants, lightboxContentVariants } from "@/lib/animations";
+import SmartImage, { LightboxRetryFallback } from "@/components/SmartImage";
 
 export interface MediaItem {
   type: "image" | "video";
@@ -18,7 +20,10 @@ interface MediaLightboxProps {
   onNavigate: (index: number) => void;
 }
 
-const MediaLightbox: React.FC<MediaLightboxProps> = ({ isOpen, onClose, items, currentIndex, onNavigate }) => {
+const MediaLightbox = React.forwardRef<HTMLDivElement, MediaLightboxProps>(function MediaLightbox(
+  { isOpen, onClose, items, currentIndex, onNavigate },
+  ref,
+) {
   useEffect(() => {
     if (!isOpen) return;
     const handleKey = (e: KeyboardEvent) => {
@@ -39,11 +44,12 @@ const MediaLightbox: React.FC<MediaLightboxProps> = ({ isOpen, onClose, items, c
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex < items.length - 1;
 
-  return (
+  const lightbox = (
     <AnimatePresence>
       {isOpen && (
         <motion.div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+          ref={ref}
+          className="fixed inset-0 z-[9999] flex items-center justify-center bg-background/95 backdrop-blur-sm"
           onClick={onClose}
           variants={overlayVariants}
           initial="initial"
@@ -102,19 +108,14 @@ const MediaLightbox: React.FC<MediaLightboxProps> = ({ isOpen, onClose, items, c
             key={currentIndex}
           >
             {current.type === "image" ? (
-              <img
+              <SmartImage
                 src={current.src}
+                srcFallbacks={getYouTubeThumbDowngrade(current.src)}
                 alt={current.alt || "Product screenshot"}
-                className="max-h-[78vh] max-w-[85vw] object-contain rounded-t-lg shadow-2xl"
-                onError={(e) => {
-                  const el = e.currentTarget;
-                  const maxResMatch = el.src.match(/img\.youtube\.com\/vi\/([a-zA-Z0-9_-]{11})\/maxresdefault/);
-                  if (maxResMatch) {
-                    el.src = `https://img.youtube.com/vi/${maxResMatch[1]}/hqdefault.jpg`;
-                    return;
-                  }
-                  el.style.display = "none";
-                }}
+                className="h-[78vh] w-[85vw] max-w-[1280px] object-contain rounded-t-lg shadow-2xl"
+                aspectRatio="16/9"
+                eager
+                fallback={(ctx) => <LightboxRetryFallback {...ctx} />}
               />
             ) : embedUrl ? (
               <iframe
@@ -170,7 +171,9 @@ const MediaLightbox: React.FC<MediaLightboxProps> = ({ isOpen, onClose, items, c
       )}
     </AnimatePresence>
   );
-};
+
+  return createPortal(lightbox, document.body);
+});
 
 /** Extract embeddable URL from YouTube/Vimeo links */
 function getEmbedUrl(url: string): string | null {
@@ -193,6 +196,17 @@ export function getYouTubeMaxResThumbnail(url: string): string | null {
   const ytMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
   if (ytMatch) return `https://img.youtube.com/vi/${ytMatch[1]}/maxresdefault.jpg`;
   return null;
+}
+
+/**
+ * For a YouTube `maxresdefault` URL, returns the deterministic downgrade chain
+ * that SmartImage should walk before entering its cache-buster retry phase.
+ * (maxresdefault doesn't exist for every video; hqdefault always does.)
+ */
+export function getYouTubeThumbDowngrade(url: string): string[] | undefined {
+  const m = url.match(/img\.youtube\.com\/vi\/([a-zA-Z0-9_-]{11})\/maxresdefault/);
+  if (!m) return undefined;
+  return [`https://img.youtube.com/vi/${m[1]}/hqdefault.jpg`];
 }
 
 /** Attempt to get a higher-resolution version of an image URL */
@@ -235,7 +249,15 @@ export function useLightbox() {
     setState((s) => ({ ...s, isOpen: false }));
   }, []);
 
-  return { state, openImage, openVideo, navigate, close };
+  // Return a STABLE object: the callbacks are already stable (useCallback), so
+  // the wrapper only changes when `state` changes (open/close/navigate). This
+  // lets consumers memoize media subtrees — critical during token streaming,
+  // where the gallery now renders alongside the prose and would otherwise
+  // re-render on every flush.
+  return useMemo(
+    () => ({ state, openImage, openVideo, navigate, close }),
+    [state, openImage, openVideo, navigate, close],
+  );
 }
 
 export default MediaLightbox;

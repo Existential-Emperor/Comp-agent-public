@@ -1,4 +1,3 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -19,7 +18,7 @@ Deno.serve(async (req) => {
       });
     }
 
-    const { createClient } = await import("jsr:@supabase/supabase-js@2");
+    const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2.45.0");
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -34,10 +33,35 @@ Deno.serve(async (req) => {
       });
     }
 
-    const { trace_id, feedback_vote, feedback_comment } = await req.json();
+    const body = await req.json();
+    const { trace_id, feedback_vote, feedback_comment } = body;
 
-    if (!trace_id || !feedback_vote || !["like", "dislike"].includes(feedback_vote)) {
-      return new Response(JSON.stringify({ error: "trace_id and feedback_vote (like/dislike) required" }), {
+    if (!trace_id) {
+      return new Response(JSON.stringify({ error: "trace_id is required" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Build update payload — only include fields that are explicitly provided
+    const updatePayload: Record<string, unknown> = {};
+
+    if (feedback_vote !== undefined) {
+      if (feedback_vote !== null && feedback_vote !== "like" && feedback_vote !== "dislike") {
+        return new Response(JSON.stringify({ error: "feedback_vote must be 'like', 'dislike', or null" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      updatePayload.feedback_vote = feedback_vote;
+    }
+
+    if (feedback_comment !== undefined) {
+      updatePayload.feedback_comment = feedback_comment || null;
+    }
+
+    if (Object.keys(updatePayload).length === 0) {
+      return new Response(JSON.stringify({ error: "No fields to update" }), {
         status: 400,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
@@ -45,10 +69,7 @@ Deno.serve(async (req) => {
 
     const { data, error } = await supabase
       .from("agent_traces")
-      .update({
-        feedback_vote: feedback_vote,
-        feedback_comment: feedback_comment || null,
-      })
+      .update(updatePayload)
       .eq("id", trace_id)
       .eq("user_id", user.id)
       .select("id, feedback_vote, feedback_comment")

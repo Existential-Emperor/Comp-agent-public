@@ -69,7 +69,7 @@ export function downloadAsDoc(content: string, filename = "competitive-analysis"
           xmlns='http://www.w3.org/TR/REC-html40'>
     <head><meta charset="utf-8">
     <style>
-      body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; color: #222; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px; }
+      body { font-family: Archivo, Calibri, Arial, sans-serif; font-size: 11pt; color: #222; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 40px; }
       h1 { font-size: 20pt; color: #1a1a2e; border-bottom: 2px solid #1a1a2e; padding-bottom: 6px; }
       h2 { font-size: 16pt; color: #16213e; border-bottom: 1px solid #ddd; padding-bottom: 4px; margin-top: 20px; }
       h3 { font-size: 13pt; color: #0f3460; margin-top: 16px; }
@@ -284,7 +284,7 @@ async function addWorkdaySectionDivider(slide: any, _pptx: any, assets: Template
   // Footer
   slide.addText("Workday Confidential", {
     x: 0.5, y: 7.0, w: 3.5, h: 0.35,
-    fontSize: 9, fontFace: "Calibri", color: WD.footer,
+    fontSize: 9, fontFace: "Archivo", color: WD.footer,
   });
 }
 
@@ -304,7 +304,7 @@ function addWorkdayContentChrome(slide: any, pptx: any, assets?: TemplateAssets,
   }
   slide.addText("Workday Confidential", {
     x: 0.5, y: 7.0, w: 4, h: 0.35,
-    fontSize: 9, fontFace: "Calibri", color: WD.footer,
+    fontSize: 9, fontFace: "Archivo", color: WD.footer,
   });
 }
 
@@ -325,71 +325,148 @@ async function addWorkdayClosingSlide(slide: any, _pptx: any, assets: TemplateAs
 // Deck title generation — smart short title from user prompt
 // ═══════════════════════════════════════════════════════════
 
+const GENERIC_DECK_HEADINGS = new Set([
+  "analysis",
+  "executive summary",
+  "introduction",
+  "overview",
+  "summary",
+  "visual overview",
+  "key findings",
+  "key themes",
+  "reference links",
+  "references",
+  "conclusion",
+  "appendix",
+  "strengths",
+  "weaknesses",
+  "opportunities",
+  "threats",
+  "swot overview",
+  "latest news",
+  "news summary",
+  "community summary",
+  "sentiment analysis",
+  "competitive signals",
+  "threats & opportunities",
+  "key takeaways",
+]);
+
+function cleanDeckTitleText(value: string): string {
+  return value
+    .replace(/\*\*/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function fitDeckTitle(value: string, maxLen = 60): string {
+  const cleaned = cleanDeckTitleText(value);
+  if (cleaned.length <= maxLen) return cleaned;
+
+  const words = cleaned.split(/\s+/);
+  let result = "";
+  for (const word of words) {
+    const candidate = result ? `${result} ${word}` : word;
+    if (candidate.length > maxLen) break;
+    result = candidate;
+  }
+
+  return result || cleaned.slice(0, maxLen);
+}
+
+function isGenericDeckHeading(value: string): boolean {
+  const normalized = cleanDeckTitleText(value).toLowerCase();
+  return GENERIC_DECK_HEADINGS.has(normalized) || /^(?:.+\s)?overview$/.test(normalized);
+}
+
+function deriveDeckTitleFromPrompt(prompt: string): string | null {
+  const cleaned = cleanDeckTitleText(prompt);
+  if (!cleaned) return null;
+
+  const subjectNames = extractCompetitorNames(cleaned);
+  const subject = subjectNames.length > 0 ? subjectNames.join(" vs ") : "";
+  const isFullProduct = /\bfull products?\b|\bfull product\b/i.test(cleaned);
+  const contextMatch = cleaned.match(/\bcontext of\s+([^.?!]+?)(?:\s*\(([^)]+)\))?(?:[.?!]|$)/i);
+
+  if (subject && isFullProduct) {
+    return fitDeckTitle(`${subject} - Full Product Analysis`);
+  }
+
+  if (subject && contextMatch) {
+    const scope = cleanDeckTitleText(contextMatch[1]).replace(/^the\s+/i, "");
+    return fitDeckTitle(`${subject} - ${scope} Analysis`);
+  }
+
+  if (subject && /\b(swot|competitive analysis|comparison|compare|comparing|analysis)\b/i.test(cleaned)) {
+    return fitDeckTitle(`${subject} - Competitive Analysis`);
+  }
+
+  const timeMatch = cleaned.match(/\b(last week|last month|last quarter|last year)\b/i);
+  const competitorMentionMatch = cleaned.match(/\b(?:about|for)\s+([A-Za-z0-9&+.' -]{2,60})\b/i);
+  const feedLabel = /\bcommunity\b/i.test(cleaned)
+    ? "Community"
+    : /\bnews\b/i.test(cleaned)
+      ? "News"
+      : /\bfeed\b/i.test(cleaned)
+        ? "Feed"
+        : "";
+
+  if (feedLabel) {
+    const subjectLabel = competitorMentionMatch
+      ? fitDeckTitle(competitorMentionMatch[1].replace(/\b(?:articles?|posts?|discussions?)\b/gi, "").trim(), 28)
+      : "";
+    const periodLabel = timeMatch ? ` - ${timeMatch[1].replace(/\b\w/g, (c) => c.toUpperCase())}` : "";
+    return fitDeckTitle(subjectLabel ? `${subjectLabel} ${feedLabel} Summary${periodLabel}` : `${feedLabel} Summary${periodLabel}`);
+  }
+
+  return null;
+}
+
 function generateDeckTitle(prompt: string, responseContent?: string): string {
-  // Prefer deriving a title from the first sentence of the response content
+  const promptDerivedTitle = deriveDeckTitleFromPrompt(prompt);
+  if (promptDerivedTitle) return promptDerivedTitle;
+
   if (responseContent) {
+    const headings = [...responseContent.matchAll(/^#{1,3}\s+(.+)$/gm)]
+      .map((match) => cleanDeckTitleText(match[1]))
+      .filter((heading) => heading.length >= 5 && heading.length <= 70 && !isGenericDeckHeading(heading) && !/^visual\s*overview$/i.test(heading));
+
+    if (headings.length > 0) {
+      return fitDeckTitle(headings[0]);
+    }
+
     const cleaned = responseContent
-      .replace(/\*\*/g, "")
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      .replace(/!\[([^\]]*)\]\([^)]+\)/g, "")
-      .replace(/^#+\s*/gm, "")
+      .replace(/^#+\s*.+$/gm, "")
       .replace(/\s+/g, " ")
       .trim();
 
-    // Grab the first sentence
     const sentenceMatch = cleaned.match(/^(.+?)[.!?:]\s/);
     const firstSentence = sentenceMatch ? sentenceMatch[1].trim() : cleaned.split("\n")[0].trim();
 
-    // Strip common preamble phrases like "Based on..., here's..."
-    const stripped = firstSentence
+    const stripped = cleanDeckTitleText(firstSentence)
       .replace(/^(?:Based on .+?,\s*(?:here(?:'s| is| are)\s*)?)/i, "")
       .replace(/^(?:Here(?:'s| is| are)\s+)/i, "")
       .replace(/^(?:This is\s+)/i, "")
+      .replace(/^(?:Below is\s+)/i, "")
+      .replace(/^(?:The following is\s+)/i, "")
       .replace(/^(?:an?\s+)/i, "")
+      .replace(/^(?:Executive\s+Summary\s*[-–:.]?\s*)/i, "")
       .trim();
 
-    // Capitalize first letter
-    const titled = stripped.charAt(0).toUpperCase() + stripped.slice(1);
-
-    // Fit to 50 chars
-    if (titled.length <= 50) return titled;
-
-    // Try clause boundary
-    const clauseMatch = titled.match(/^(.{10,50}?)(?:[,;:]\s|\sand\s|\swith\s|\sfor\s|\sin\s|\salong\s)/i);
-    if (clauseMatch) return clauseMatch[1].trim();
-
-    // Word-fit
-    const words = titled.split(/\s+/);
-    let result = "";
-    for (const word of words) {
-      const candidate = result ? `${result} ${word}` : word;
-      if (candidate.length > 50) break;
-      result = candidate;
+    if (stripped) {
+      return fitDeckTitle(stripped, 50);
     }
-    return result || titled.slice(0, 50);
   }
 
-  // Fallback: use prompt
-  let cleaned = prompt
-    .replace(/\*\*/g, "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
+  const cleanedPrompt = cleanDeckTitleText(prompt);
+  if (cleanedPrompt.length <= 42) return cleanedPrompt;
 
-  if (cleaned.length <= 42) return cleaned;
-
-  const clauseMatch = cleaned.match(/^(.{10,42}?)(?:[.?!;:,]\s|—|\s[-–]\s|\sand\s|\swith\s|\sfor\s|\sin\s)/i);
+  const clauseMatch = cleanedPrompt.match(/^(.{10,42}?)(?:[.?!;:,]\s|—|\s[-–]\s|\sand\s|\swith\s|\sfor\s|\sin\s)/i);
   if (clauseMatch) return clauseMatch[1].trim();
 
-  const words = cleaned.split(/\s+/);
-  let title = "";
-  for (const word of words) {
-    const candidate = title ? `${title} ${word}` : word;
-    if (candidate.length > 42) break;
-    title = candidate;
-  }
-
-  return title || cleaned.slice(0, 42);
+  return fitDeckTitle(cleanedPrompt, 42);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -646,28 +723,6 @@ async function batchSummarizeAllBullets(
   return sectionOffsets.map(({ start, count }) => resolved.slice(start, start + count));
 }
 
-/**
- * Simple non-AI condense for SWOT overview quadrant (space-constrained).
- */
-function condenseBullet(text: string, maxLen = 120): string {
-  const cleaned = text
-    .replace(/\*\*/g, "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .trim();
-  const sentenceMatch = cleaned.match(/^(.+?[.!?])\s/);
-  const core = sentenceMatch ? sentenceMatch[1] : cleaned.split(/[;:\u2014\u2013]/)[0].trim();
-  return core.length > maxLen ? core.slice(0, maxLen - 1) + "…" : core;
-}
-
-/**
- * Condense SWOT bullet items into a concise semantic summary
- * for the 2x2 overview slide. Full details appear on detail slides.
- */
-function summarizeSwotItems(items: string[], label: string): string {
-  if (items.length === 0) return `• No ${label.toLowerCase()} data available`;
-  const summaries = items.slice(0, 5).map((item) => condenseBullet(item, 90));
-  return summaries.map((s) => `• ${s}`).join("\n");
-}
 
 /**
  * Extract all reference links from markdown content.
@@ -675,14 +730,35 @@ function summarizeSwotItems(items: string[], label: string): string {
 function extractAllLinks(content: string): { label: string; url: string }[] {
   const links: { label: string; url: string }[] = [];
   const seen = new Set<string>();
-  const regex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+  // Skip image markdown (![alt](url)) — only match text links [label](url)
+  const regex = /(?<!!)\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
   let match;
   while ((match = regex.exec(content)) !== null) {
-    if (!seen.has(match[2])) {
-      seen.add(match[2]);
-      links.push({ label: match[1], url: match[2] });
+    const url = match[2];
+    // Filter out media/screenshot URLs
+    const isMedia = /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)(\?|$)/i.test(url)
+      || /competitor-screenshots/i.test(url)
+      || /\/storage\/v1\/object\/public\//i.test(url);
+    if (!isMedia && !seen.has(url)) {
+      seen.add(url);
+      links.push({ label: match[1], url });
     }
   }
+
+  // Second pass: capture bare URLs not inside markdown link syntax
+  const bareUrlRegex = /(?<!\]\()https?:\/\/[^\s)<>]+/g;
+  let bareMatch;
+  while ((bareMatch = bareUrlRegex.exec(content)) !== null) {
+    const url = bareMatch[0];
+    const isMedia = /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)(\?|$)/i.test(url)
+      || /competitor-screenshots/i.test(url)
+      || /\/storage\/v1\/object\/public\//i.test(url);
+    if (!isMedia && !seen.has(url)) {
+      seen.add(url);
+      links.push({ label: url, url });
+    }
+  }
+
   return links;
 }
 
@@ -695,7 +771,7 @@ function addReferencesSlide(pptx: any, assets: TemplateAssets, links: { label: s
   addWorkdayContentChrome(slide, pptx, assets, true);
   slide.addText("Reference Links", {
     x: 0.8, y: 0.3, w: 11.5, h: 0.7,
-    fontSize: 28, fontFace: "Calibri", color: WD.waterCooler, bold: true,
+    fontSize: 28, fontFace: "Archivo", color: WD.waterCooler, bold: true,
   });
   slide.addShape(pptx.ShapeType.rect, {
     x: 0.8, y: 1.0, w: 3, h: 0.04,
@@ -704,10 +780,9 @@ function addReferencesSlide(pptx: any, assets: TemplateAssets, links: { label: s
   // Show up to 12 links
   const displayLinks = links.slice(0, 12);
   const linkRows = displayLinks.map((l, i) => ({
-    text: `${i + 1}. ${l.label}`,
+    text: `${i + 1}. ${l.url}`,
     options: {
-      fontSize: 11, fontFace: "Calibri", color: WD.ballpoint,
-      hyperlink: { url: l.url },
+      fontSize: 11, fontFace: "Archivo", color: WD.ballpoint,
       bullet: false,
       breakLine: true,
     },
@@ -718,257 +793,31 @@ function addReferencesSlide(pptx: any, assets: TemplateAssets, links: { label: s
   });
 }
 
+
 // ═══════════════════════════════════════════════════════════
-// SWOT Slide Generation
+// Height estimation helpers for dynamic slide pagination
 // ═══════════════════════════════════════════════════════════
 
-export async function generateSwotSlides(
-  content: string,
-  competitorNames: string[],
-  category: string,
-  subCategory: string,
-  options?: SlideSummaryOptions,
-): Promise<void> {
-  const pptx = new PptxGenJS();
-  pptx.layout = "LAYOUT_WIDE";
-  pptx.author = "Comp Intelligence Agent";
-  pptx.title = `SWOT Analysis — ${competitorNames.join(" vs ")}`;
-  const storedSlideSummaries = await loadStoredSlideSummaryMetadata(options);
+const MAX_CONTENT_HEIGHT = 5.65; // usable zone: y=1.3 to y=6.95
 
-  // Load actual template assets
-  const assets = await loadTemplateAssets();
-
-  // ── Title Slide (pixel-perfect gradient bg from template) ──
-  const titleSlide = pptx.addSlide();
-  await addWorkdayTitleBg(titleSlide, pptx, assets);
-  const swotDeckTitle = generateDeckTitle(competitorNames.join(" vs ") + " SWOT Analysis", content);
-  titleSlide.addText(swotDeckTitle.toUpperCase(), {
-    x: 0.8, y: 4.0, w: 11.5, h: 1,
-    fontSize: 44, fontFace: "Calibri", color: WD.ink, bold: true,
-  });
-  titleSlide.addText("Comp Agent Analysis", {
-    x: 0.8, y: 5.1, w: 11.5, h: 0.6,
-    fontSize: 22, fontFace: "Calibri", color: WD.ink,
-  });
-  titleSlide.addText(`${category}${subCategory && subCategory !== category ? ` · ${subCategory}` : ""}`, {
-    x: 0.8, y: 5.8, w: 11.5, h: 0.5,
-    fontSize: 16, fontFace: "Calibri", color: WD.ink, transparency: 30,
-  });
-  titleSlide.addText(new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }), {
-    x: 0.8, y: 6.5, w: 11.5, h: 0.4,
-    fontSize: 14, fontFace: "Calibri", color: WD.ink, transparency: 50,
-  });
-
-  // ── Parse SWOT for each competitor ──
-  for (const comp of competitorNames) {
-    const swot = extractSwot(content, comp);
-
-    // Section divider slide (pixel-perfect left gradient strip from template)
-    const headerSlide = pptx.addSlide();
-    await addWorkdaySectionDivider(headerSlide, pptx, assets);
-    headerSlide.addText(comp, {
-      x: 5.0, y: 2.0, w: 7.5, h: 1.5,
-      fontSize: 40, fontFace: "Calibri", color: WD.ink, bold: true,
-    });
-    headerSlide.addText("SWOT OVERVIEW", {
-      x: 5.0, y: 1.5, w: 7.5, h: 0.5,
-      fontSize: 14, fontFace: "Calibri", color: WD.waterCooler, charSpacing: 3,
-    });
-
-    // 2x2 SWOT grid slide (content layout from template)
-    const gridSlide = pptx.addSlide();
-    addWorkdayContentChrome(gridSlide, pptx);
-    gridSlide.addText(`${comp} — SWOT Overview`, {
-      x: 0.8, y: 0.2, w: 12, h: 0.6,
-      fontSize: 24, fontFace: "Calibri", color: WD.ink, bold: true,
-    });
-
-    // Use Workday Ink blue for all quadrant accents (consistent brand)
-    const quadrantAccent = WD.ink;
-    const quadrants = [
-      { label: "Strengths", items: swot.strengths, x: 0.6, y: 1.0 },
-      { label: "Weaknesses", items: swot.weaknesses, x: 6.8, y: 1.0 },
-      { label: "Opportunities", items: swot.opportunities, x: 0.6, y: 4.0 },
-      { label: "Threats", items: swot.threats, x: 6.8, y: 4.0 },
-    ];
-
-    for (const q of quadrants) {
-      // Card background — dark blue (Ink)
-      gridSlide.addShape(pptx.ShapeType.rect, {
-        x: q.x, y: q.y, w: 6, h: 2.7,
-        fill: { color: WD.ink },
-        rectRadius: 0.08,
-      });
-      // Accent top bar — Water Cooler
-      gridSlide.addShape(pptx.ShapeType.rect, {
-        x: q.x, y: q.y, w: 6, h: 0.06,
-        fill: { color: WD.waterCooler },
-      });
-      // Label — white on dark bg
-      gridSlide.addText(q.label.toUpperCase(), {
-        x: q.x + 0.3, y: q.y + 0.15, w: 5.4, h: 0.4,
-        fontSize: 14, fontFace: "Calibri", color: WD.blueSky, bold: true,
-      });
-      // Semantic summary — white text on dark bg
-      const summaryText = summarizeSwotItems(q.items, q.label);
-      gridSlide.addText(summaryText, {
-        x: q.x + 0.3, y: q.y + 0.55, w: 5.4, h: 2.05,
-        fontSize: 11, fontFace: "Calibri", color: WD.paper,
-        valign: "top", lineSpacingMultiple: 1.2,
-        wrap: true,
-      });
-    }
-
-    // Batch-summarize ALL quadrant bullets in a SINGLE AI call
-    const quadrantEntries = quadrants
-      .filter(q => q.items.length > 0)
-      .map(q => ({ bullets: q.items, context: `${comp} SWOT ${q.label}` }));
-    const allQuadrantSummarized = await batchSummarizeAllBullets(quadrantEntries, storedSlideSummaries);
-
-    // Map summarized results back to quadrants
-    let entryIdx = 0;
-    const quadrantSummaryMap = new Map<string, string[]>();
-    for (const q of quadrants) {
-      if (q.items.length > 0) {
-        quadrantSummaryMap.set(q.label, allQuadrantSummarized[entryIdx] || []);
-        entryIdx++;
-      } else {
-        quadrantSummaryMap.set(q.label, []);
-      }
-    }
-
-    // Individual detail slides for each quadrant
-    for (const q of quadrants) {
-      if (q.items.length === 0) continue;
-      const summarized = quadrantSummaryMap.get(q.label) || [];
-
-      const ITEMS_PER_DETAIL = 4;
-      for (let page = 0; page < summarized.length; page += ITEMS_PER_DETAIL) {
-        const pageItems = summarized.slice(page, page + ITEMS_PER_DETAIL);
-        const detailSlide = pptx.addSlide();
-        addWorkdayContentChrome(detailSlide, pptx, assets, true);
-        detailSlide.addShape(pptx.ShapeType.rect, {
-          x: 0, y: 0, w: 13.33, h: 0.06,
-          fill: { color: WD.waterCooler },
-        });
-        detailSlide.addText(`${comp}`, {
-          x: 0.8, y: 0.3, w: 12, h: 0.4,
-          fontSize: 14, fontFace: "Calibri", color: WD.footer,
-        });
-        const pageLabel = summarized.length > ITEMS_PER_DETAIL
-          ? `${q.label} (${page / ITEMS_PER_DETAIL + 1}/${Math.ceil(summarized.length / ITEMS_PER_DETAIL)})`
-          : q.label;
-        detailSlide.addText(pageLabel, {
-          x: 0.8, y: 0.7, w: 12, h: 0.6,
-          fontSize: 28, fontFace: "Calibri", color: WD.waterCooler, bold: true,
-        });
-
-        const bulletContent = pageItems.map((item, idx) => `${page + idx + 1}.  ${item}`).join("\n\n");
-        detailSlide.addText(bulletContent, {
-          x: 0.8, y: 1.5, w: 11.5, h: 5.2,
-          fontSize: 13, fontFace: "Calibri", color: WD.ink,
-          valign: "top", lineSpacingMultiple: 1.3,
-          wrap: true,
-        });
-      }
-    }
-  }
-
-  // ── Summary slide ──
-  const summarySlide = pptx.addSlide();
-  addWorkdayContentChrome(summarySlide, pptx, assets, true);
-  summarySlide.addText("Key Takeaways", {
-    x: 0.8, y: 0.5, w: 11.5, h: 0.8,
-    fontSize: 34, fontFace: "Calibri", color: WD.waterCooler, bold: true,
-  });
-  // AI-summarize the top strength and risk for each competitor
-  const takeawayBullets = competitorNames.map((comp) => {
-    const swot = extractSwot(content, comp);
-    const strength = swot.strengths[0] || "Strong market presence";
-    const risk = swot.threats[0] || swot.weaknesses[0] || "Competitive pressure";
-    return `${comp} — Strength: ${strength} | Risk: ${risk}`;
-  });
-  const summarizedTakeaways = await summarizeBulletsForSlides(takeawayBullets, "Key competitive takeaways", storedSlideSummaries);
-  const takeawaysText = summarizedTakeaways.map((t, i) => `${i + 1}. ${t}`).join("\n\n");
-  summarySlide.addText(takeawaysText, {
-    x: 0.8, y: 1.5, w: 11.5, h: 5,
-    fontSize: 16, fontFace: "Calibri", color: WD.ink,
-    valign: "top", lineSpacingMultiple: 1.4, wrap: true,
-    shrinkText: false,
-  });
-
-  // ── Reference Links slide ──
-  const allLinks = extractAllLinks(content);
-  addReferencesSlide(pptx, assets, allLinks);
-
-  // ── Closing slide (pixel-perfect from template) ──
-  const endSlide = pptx.addSlide();
-  await addWorkdayClosingSlide(endSlide, pptx, assets);
-
-  const fileName = `Comp_Agent_Analysis_${competitorNames.join("_vs_")}_${new Date().toISOString().slice(0, 10)}`;
-  await pptx.writeFile({ fileName });
+function estimateBulletHeight(text: string, fontSize = 12, boxWidth = 11.5): number {
+  const charsPerLine = Math.floor(boxWidth * (140 / 11.5)); // ~140 chars at 11.5"
+  const lines = Math.max(1, Math.ceil(text.length / charsPerLine));
+  const lineHeight = (fontSize / 72) * 1.25; // inches
+  return lines * lineHeight + 0.15; // + paragraph spacing
 }
 
-/**
- * Extract SWOT items for a specific competitor from the content
- */
-function extractSwot(content: string, competitor: string): {
-  strengths: string[];
-  weaknesses: string[];
-  opportunities: string[];
-  threats: string[];
-} {
-  const result = { strengths: [] as string[], weaknesses: [] as string[], opportunities: [] as string[], threats: [] as string[] };
-  
-  const lines = content.split("\n");
-  let currentCategory: keyof typeof result | null = null;
-
-  for (const line of lines) {
-    const lower = line.toLowerCase().trim();
-    
-    if (/strength/i.test(lower)) currentCategory = "strengths";
-    else if (/weakness|limitation|gap/i.test(lower)) currentCategory = "weaknesses";
-    else if (/opportunit/i.test(lower)) currentCategory = "opportunities";
-    else if (/threat|risk|challenge/i.test(lower)) currentCategory = "threats";
-    else if (/^#{1,2}\s+/.test(line) && !currentCategory) currentCategory = null;
-
-    const bulletMatch = line.match(/^\s*[-*•·]\s+(.+)/);
-    if (bulletMatch && currentCategory) {
-      const item = bulletMatch[1]
-        .replace(/\*\*/g, "")
-        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-        .trim();
-      if (item.length > 5 && item.length < 300) {
-        result[currentCategory].push(item);
-      }
-    }
-  }
-
-  if (result.strengths.length > 0 || result.weaknesses.length > 0 || 
-      result.opportunities.length > 0 || result.threats.length > 0) {
-    return result;
-  }
-
-  // Fallback: heuristic classification
-  const allBullets = content.match(/^\s*[-*•]\s+(.+)/gm) || [];
-  const cleaned = allBullets.map(b => b.replace(/^\s*[-*•]\s+/, "").replace(/\*\*/g, "").trim()).filter(b => b.length > 10);
-  
-  for (const bullet of cleaned) {
-    const lower = bullet.toLowerCase();
-    if (/strong|leading|best|excellent|powerful|robust|comprehensive|mature/i.test(lower)) {
-      result.strengths.push(bullet);
-    } else if (/weak|lack|limited|poor|missing|no support|behind/i.test(lower)) {
-      result.weaknesses.push(bullet);
-    } else if (/opportunit|potential|could|emerging|growing|expand/i.test(lower)) {
-      result.opportunities.push(bullet);
-    } else if (/threat|risk|compet|disrupt|pressure|challenge/i.test(lower)) {
-      result.threats.push(bullet);
-    } else {
-      result.strengths.push(bullet);
-    }
-  }
-
-  return result;
+function estimateTableRowHeight(cells: string[], colWidths: number[], fontSize = 10): number {
+  const charsPerInch = 14; // approx at 10pt Archivo
+  let maxLines = 1;
+  cells.forEach((cell, i) => {
+    const width = colWidths[i] || 1;
+    const charsPerLine = Math.floor(width * charsPerInch);
+    const lines = Math.max(1, Math.ceil(cleanCellText(cell).length / charsPerLine));
+    maxLines = Math.max(maxLines, lines);
+  });
+  const lineHeight = (fontSize / 72) * 1.2;
+  return Math.max(maxLines * lineHeight + 0.08, 0.4);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -996,95 +845,202 @@ export async function generateFeedSlides(
   const deckTitle = generateDeckTitle(title, content);
   titleSlide.addText(deckTitle.toUpperCase(), {
     x: 0.8, y: 4.0, w: 11.5, h: 1,
-    fontSize: 40, fontFace: "Calibri", color: WD.ink, bold: true,
+    fontSize: 40, fontFace: "Archivo", color: WD.ink, bold: true,
   });
   const subHeader = 'Comp Agent Analysis';
   titleSlide.addText(subHeader, {
     x: 0.8, y: 5.1, w: 11.5, h: 0.6,
-    fontSize: 20, fontFace: "Calibri", color: WD.ink, transparency: 30,
+    fontSize: 20, fontFace: "Archivo", color: WD.ink, transparency: 30,
   });
   titleSlide.addText(new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }), {
     x: 0.8, y: 5.8, w: 11.5, h: 0.5,
-    fontSize: 14, fontFace: "Calibri", color: WD.ink, transparency: 50,
+    fontSize: 14, fontFace: "Archivo", color: WD.ink, transparency: 50,
   });
 
-  // Parse content into sections
-  const sections = parseFeedContentSections(content);
+  // Strip "Reference Links" section before parsing — it's handled separately by addReferencesSlide
+  const refLinksPattern = /^#{1,3}\s*Reference\s*Links[\s\S]*/im;
+  const contentWithoutRefLinks = content.replace(refLinksPattern, "").trim();
 
-  // Batch-summarize ALL section bullets in a SINGLE AI call
-  const sectionEntries = sections.map(s => ({ bullets: s.points, context: s.heading }));
-  const allSummarized = await batchSummarizeAllBullets(sectionEntries, storedSlideSummaries);
+  // Parse content into sections (handles tables, paragraphs, bullets)
+  const allSections = parseFeedContentSections(contentWithoutRefLinks);
 
+  // Visual Overview is chat-only — drop it before slide generation so PPTX
+  // doesn't render image/video markdown tokens that PowerPoint can't resolve.
+  const sections = allSections.filter(
+    (s) => !/^visual\s*overview$/i.test((s.heading || "").trim()),
+  );
+
+  // Separate table sections from bullet/paragraph sections for different rendering
   for (let sIdx = 0; sIdx < sections.length; sIdx++) {
     const section = sections[sIdx];
-    const summarized = allSummarized[sIdx] || [];
-    const slide = pptx.addSlide();
-    addWorkdayContentChrome(slide, pptx, assets, true);
 
-    slide.addText(section.heading, {
-      x: 0.8, y: 0.3, w: 11.5, h: 0.7,
-      fontSize: 26, fontFace: "Calibri", color: WD.waterCooler, bold: true,
-    });
+    // ── Table sections: render as native PPTX tables ──
+    if (section.table && section.table.length > 0) {
+      const table = section.table;
+      const headerRow = table[0];
+      const dataRows = table.slice(1);
+      const colCount = headerRow.length;
 
-    slide.addShape(pptx.ShapeType.rect, {
-      x: 0.8, y: 1.0, w: 3, h: 0.04,
-      fill: { color: WD.waterCooler },
-    });
+      // Calculate column widths upfront for height estimation
+      const tableW = 11.7;
+      const colWidths = colCount <= 2
+        ? Array(colCount).fill(tableW / colCount)
+        : [tableW * 0.22, ...Array(colCount - 1).fill((tableW * 0.78) / (colCount - 1))];
 
-    const POINTS_PER_SLIDE = 4;
-    const firstPage = summarized.slice(0, POINTS_PER_SLIDE);
-    const bulletText = firstPage.map(p => `• ${p}`).join("\n\n");
-    slide.addText(bulletText, {
-      x: 0.8, y: 1.3, w: 11.5, h: 5.4,
-      fontSize: 12, fontFace: "Calibri", color: WD.ink,
-      valign: "top", lineSpacingMultiple: 1.25, wrap: true,
-    });
+      // Split data rows into pages using dynamic height budget
+      const HEADER_ROW_HEIGHT = 0.5;
 
-    for (let overflow = POINTS_PER_SLIDE; overflow < summarized.length; overflow += POINTS_PER_SLIDE) {
-      const overflowSlide = pptx.addSlide();
-      addWorkdayContentChrome(overflowSlide, pptx, assets, true);
-      overflowSlide.addText(`${section.heading} (cont.)`, {
+      let pageStart = 0;
+      while (pageStart < dataRows.length) {
+        let usedHeight = HEADER_ROW_HEIGHT;
+        let pageEnd = pageStart;
+        while (pageEnd < dataRows.length) {
+          const rowHeight = estimateTableRowHeight(dataRows[pageEnd], colWidths);
+          if (usedHeight + rowHeight > MAX_CONTENT_HEIGHT && pageEnd > pageStart) break;
+          usedHeight += rowHeight;
+          pageEnd++;
+        }
+        const pageRows = dataRows.slice(pageStart, pageEnd);
+        const slide = pptx.addSlide();
+        addWorkdayContentChrome(slide, pptx, assets, true);
+
+        const headingLabel = pageStart === 0 ? section.heading : `${section.heading} (cont.)`;
+        slide.addText(headingLabel, {
+          x: 0.8, y: 0.3, w: 11.5, h: 0.6,
+          fontSize: 22, fontFace: "Archivo", color: WD.waterCooler, bold: true,
+        });
+        slide.addShape(pptx.ShapeType.rect, {
+          x: 0.8, y: 0.85, w: 3, h: 0.04,
+          fill: { color: WD.waterCooler },
+        });
+
+        // Build table rows for PptxGenJS (reuse colWidths from above)
+
+        // Build table rows for PptxGenJS
+        const tblRows: any[][] = [];
+
+        // Header row
+        tblRows.push(
+          headerRow.map((cell) => ({
+            text: cleanCellText(cell),
+            options: {
+              bold: true, fontSize: 9, fontFace: "Archivo", color: WD.paper,
+              fill: { color: WD.ink }, valign: "middle",
+              border: { pt: 0.5, color: WD.blueSky },
+              margin: [4, 4, 4, 4],
+            },
+          }))
+        );
+
+        // Data rows with alternating background
+        for (let rIdx = 0; rIdx < pageRows.length; rIdx++) {
+          const row = pageRows[rIdx];
+          const bgColor = rIdx % 2 === 0 ? "F5F7FA" : WD.paper;
+          tblRows.push(
+            row.map((cell, cIdx) => ({
+              text: cleanCellText(cell),
+              options: {
+                fontSize: 10, fontFace: "Archivo", color: WD.ink,
+                fill: { color: bgColor }, valign: "top",
+                bold: cIdx === 0,
+                border: { pt: 0.5, color: "E2E8F0" },
+                margin: [3, 3, 3, 3],
+              },
+            }))
+          );
+        }
+
+        // Compute per-row heights for the table
+        const rowHeights = [HEADER_ROW_HEIGHT, ...pageRows.map(r => estimateTableRowHeight(r, colWidths))];
+
+        slide.addTable(tblRows, {
+          x: 0.8, y: 1.05, w: tableW,
+          colW: colWidths,
+          rowH: rowHeights,
+          border: { pt: 0.5, color: "E2E8F0" },
+          autoPage: false,
+        });
+
+        pageStart = pageEnd;
+      }
+      continue;
+    }
+
+    // ── Bullet / paragraph sections: summarize and render as bullet points ──
+    if (section.points.length === 0) continue;
+
+    // Summarize in batch (single AI call handled upstream)
+    const summarized = await summarizeBulletsForSlides(section.points, section.heading, storedSlideSummaries);
+
+    let bPageStart = 0;
+    while (bPageStart < summarized.length) {
+      let usedHeight = 0;
+      let bPageEnd = bPageStart;
+      while (bPageEnd < summarized.length) {
+        const itemHeight = estimateBulletHeight(`• ${summarized[bPageEnd]}`);
+        if (usedHeight + itemHeight > MAX_CONTENT_HEIGHT && bPageEnd > bPageStart) break;
+        usedHeight += itemHeight;
+        bPageEnd++;
+      }
+      const pagePoints = summarized.slice(bPageStart, bPageEnd);
+      const slide = pptx.addSlide();
+      addWorkdayContentChrome(slide, pptx, assets, true);
+
+      const headingLabel = bPageStart === 0 ? section.heading : `${section.heading} (cont.)`;
+      slide.addText(headingLabel, {
         x: 0.8, y: 0.3, w: 11.5, h: 0.7,
-        fontSize: 24, fontFace: "Calibri", color: WD.waterCooler, bold: true,
+        fontSize: 26, fontFace: "Archivo", color: WD.waterCooler, bold: true,
       });
-      overflowSlide.addShape(pptx.ShapeType.rect, {
+      slide.addShape(pptx.ShapeType.rect, {
         x: 0.8, y: 1.0, w: 3, h: 0.04,
         fill: { color: WD.waterCooler },
       });
-      const overflowPoints = summarized.slice(overflow, overflow + POINTS_PER_SLIDE);
-      const overflowText = overflowPoints.map(p => `• ${p}`).join("\n\n");
-      overflowSlide.addText(overflowText, {
-        x: 0.8, y: 1.3, w: 11.5, h: 5.4,
-        fontSize: 12, fontFace: "Calibri", color: WD.ink,
+
+      const contentHeight = Math.min(usedHeight + 0.3, MAX_CONTENT_HEIGHT);
+      const bulletText = pagePoints.map(p => `• ${p}`).join("\n\n");
+      slide.addText(bulletText, {
+        x: 0.8, y: 1.3, w: 11.5, h: contentHeight,
+        fontSize: 12, fontFace: "Archivo", color: WD.ink,
         valign: "top", lineSpacingMultiple: 1.25, wrap: true,
       });
+      bPageStart = bPageEnd;
     }
   }
 
-  // Fallback: no sections parsed
+  // Fallback: no sections parsed at all
   if (sections.length === 0) {
     const allBullets = content.match(/^\s*[-*•]\s+(.+)/gm) || [];
     const cleaned = allBullets.map(b => b.replace(/^\s*[-*•]\s+/, "").replace(/\*\*/g, "").trim()).filter(b => b.length > 10);
     if (cleaned.length > 0) {
       const summarized = await summarizeBulletsForSlides(cleaned, "Key findings", storedSlideSummaries);
-      const ITEMS_PER_SLIDE = 5;
-      for (let i = 0; i < summarized.length; i += ITEMS_PER_SLIDE) {
+      let fbStart = 0;
+      while (fbStart < summarized.length) {
+        let usedHeight = 0;
+        let fbEnd = fbStart;
+        while (fbEnd < summarized.length) {
+          const itemHeight = estimateBulletHeight(`• ${summarized[fbEnd]}`);
+          if (usedHeight + itemHeight > MAX_CONTENT_HEIGHT && fbEnd > fbStart) break;
+          usedHeight += itemHeight;
+          fbEnd++;
+        }
         const slide = pptx.addSlide();
         addWorkdayContentChrome(slide, pptx, assets, true);
         slide.addText("Key Findings", {
           x: 0.8, y: 0.3, w: 11.5, h: 0.7,
-          fontSize: 26, fontFace: "Calibri", color: WD.waterCooler, bold: true,
+          fontSize: 26, fontFace: "Archivo", color: WD.waterCooler, bold: true,
         });
         slide.addShape(pptx.ShapeType.rect, {
           x: 0.8, y: 1.0, w: 3, h: 0.04,
           fill: { color: WD.waterCooler },
         });
-        const bullets = summarized.slice(i, i + ITEMS_PER_SLIDE).map(p => `• ${p}`).join("\n\n");
+        const fbContentHeight = Math.min(usedHeight + 0.3, MAX_CONTENT_HEIGHT);
+        const bullets = summarized.slice(fbStart, fbEnd).map(p => `• ${p}`).join("\n\n");
         slide.addText(bullets, {
-          x: 0.8, y: 1.3, w: 11.5, h: 5.2,
-          fontSize: 12, fontFace: "Calibri", color: WD.ink,
+          x: 0.8, y: 1.3, w: 11.5, h: fbContentHeight,
+          fontSize: 12, fontFace: "Archivo", color: WD.ink,
           valign: "top", lineSpacingMultiple: 1.3, wrap: true,
         });
+        fbStart = fbEnd;
       }
     }
   }
@@ -1102,28 +1058,74 @@ export async function generateFeedSlides(
 }
 
 /**
- * Parse feed agent content into slide-friendly sections
+ * Clean markdown formatting from a table cell for PPTX display.
  */
-function parseFeedContentSections(content: string): { heading: string; points: string[]; links: { label: string; url: string }[] }[] {
-  const sections: { heading: string; points: string[]; links: { label: string; url: string }[] }[] = [];
+function cleanCellText(cell: string): string {
+  return cell
+    .replace(/\*\*/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "")
+    .trim();
+}
+
+/**
+ * Parse feed agent content into slide-friendly sections.
+ * Handles markdown headings, bullet points, tables, and paragraphs.
+ */
+function parseFeedContentSections(content: string): { heading: string; points: string[]; links: { label: string; url: string }[]; table?: string[][] }[] {
+  const sections: { heading: string; points: string[]; links: { label: string; url: string }[]; table?: string[][] }[] = [];
   const lines = content.split("\n");
   let currentHeading = "";
   let currentPoints: string[] = [];
   let currentLinks: { label: string; url: string }[] = [];
+  let currentTable: string[][] = [];
+  let inTable = false;
+
+  const flushSection = () => {
+    if (!currentHeading) return;
+    if (currentTable.length > 1) {
+      // Table section (has header + at least 1 data row)
+      sections.push({ heading: currentHeading, points: [], links: currentLinks, table: currentTable });
+    } else if (currentPoints.length > 0) {
+      sections.push({ heading: currentHeading, points: currentPoints, links: currentLinks });
+    }
+    currentPoints = [];
+    currentLinks = [];
+    currentTable = [];
+    inTable = false;
+  };
 
   for (const line of lines) {
-    const headingMatch = line.match(/^#{1,3}\s+(.+)/);
+    const trimmed = line.trim();
+
+    // ── Heading ──
+    const headingMatch = trimmed.match(/^#{1,3}\s+(.+)/);
     if (headingMatch) {
-      if (currentHeading && (currentPoints.length > 0 || currentLinks.length > 0)) {
-        sections.push({ heading: currentHeading, points: currentPoints, links: currentLinks });
-      }
+      flushSection();
       currentHeading = headingMatch[1].replace(/\*\*/g, "").trim();
-      currentPoints = [];
-      currentLinks = [];
       continue;
     }
 
-    const bulletMatch = line.match(/^\s*[-*•]\s+(.+)/);
+    // ── Table row ──
+    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+      const cells = trimmed.split("|").slice(1, -1).map(c => c.trim());
+      // Skip separator rows (e.g. |---|---|)
+      if (cells.every(c => /^[\s\-:]+$/.test(c))) {
+        continue;
+      }
+      inTable = true;
+      currentTable.push(cells);
+      continue;
+    }
+
+    // If we were in a table and hit a non-table line, the table ended
+    if (inTable && trimmed !== "") {
+      // Don't flush yet — more content under the same heading
+      inTable = false;
+    }
+
+    // ── Bullet point ──
+    const bulletMatch = trimmed.match(/^\s*[-*•]\s+(.+)/);
     if (bulletMatch) {
       let text = bulletMatch[1].replace(/\*\*/g, "").trim();
       const linkMatches = [...text.matchAll(/\[([^\]]+)\]\(([^)]+)\)/g)];
@@ -1134,12 +1136,24 @@ function parseFeedContentSections(content: string): { heading: string; points: s
       if (text.length > 5) {
         currentPoints.push(text);
       }
+      continue;
+    }
+
+    // ── Paragraph text ──
+    if (trimmed.length > 20 && currentHeading && !trimmed.startsWith("|")) {
+      // Collect substantial paragraph text as a "point"
+      let text = trimmed
+        .replace(/\*\*/g, "")
+        .replace(/!\[([^\]]*)\]\([^)]+\)/g, "")  // strip images
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+        .trim();
+      if (text.length > 20) {
+        currentPoints.push(text);
+      }
     }
   }
 
-  if (currentHeading && (currentPoints.length > 0 || currentLinks.length > 0)) {
-    sections.push({ heading: currentHeading, points: currentPoints, links: currentLinks });
-  }
+  flushSection();
 
   return sections;
 }

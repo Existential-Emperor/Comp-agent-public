@@ -1,4 +1,4 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { requireAuth } from "../_shared/auth.ts";
 import { firecrawlFetch, hasFirecrawlKey } from "../_shared/firecrawl-keys.ts";
 
 const corsHeaders = {
@@ -32,6 +32,7 @@ interface RatedMedia extends MediaItem {
 interface MediaQualityResult {
   filteredMedia: RatedMedia[];
   rejectedMedia: RatedMedia[];
+  unratedMedia: RatedMedia[];
   discoveredVideos: { url: string; title: string; score: number }[];
 }
 
@@ -87,7 +88,7 @@ Return ONLY the JSON array, no other text.`;
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
+        model: "openai/gpt-5.5",
         messages: [
           {
             role: "user",
@@ -101,24 +102,25 @@ Return ONLY the JSON array, no other text.`;
             ],
           },
         ],
-        max_tokens: 2000,
+        max_completion_tokens: 2000,
       }),
     });
 
     if (!res.ok) {
-      console.error(`Vision rating failed: ${res.status}`);
-      // Fallback: return all images with score 5 (uncertain)
-      return images.map(img => ({ ...img, score: 5, reasoning: "Vision rating unavailable — defaulting to uncertain" }));
+      const errBody = await res.text().catch(() => "");
+      console.error(`Vision rating failed: ${res.status} ${errBody.slice(0, 400)}`);
+      // Mark as unrated (score 0) so caller can apply entity-matched fallback
+      return images.map(img => ({ ...img, score: 0, reasoning: `unrated:rater_http_${res.status}` }));
     }
 
     const data = await res.json();
     const rawContent = data.choices?.[0]?.message?.content || "";
-    
+
     // Parse JSON from response
     const jsonMatch = rawContent.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
       console.error("Failed to parse vision rating JSON:", rawContent.slice(0, 200));
-      return images.map(img => ({ ...img, score: 5, reasoning: "Parse error — defaulting to uncertain" }));
+      return images.map(img => ({ ...img, score: 0, reasoning: "unrated:parse_error" }));
     }
 
     const ratings = JSON.parse(jsonMatch[0]) as Array<{ index: number; score: number; reasoning: string }>;
@@ -151,7 +153,7 @@ Return ONLY the JSON array, no other text.`;
     });
   } catch (err) {
     console.error("Vision rating error:", err);
-    return images.map(img => ({ ...img, score: 5, reasoning: "Vision error — defaulting to uncertain" }));
+    return images.map(img => ({ ...img, score: 0, reasoning: `unrated:exception:${err instanceof Error ? err.message : String(err)}` }));
   }
 }
 
@@ -191,31 +193,35 @@ Return ONLY the JSON array.`;
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOVABLE_API_KEY}` },
       body: JSON.stringify({
-        model: "google/gemini-2.5-flash-lite",
+        model: "openai/gpt-5.5",
         messages: [{ role: "user", content: prompt }],
-        max_tokens: 1500,
+        max_completion_tokens: 1500,
       }),
     });
 
     if (!res.ok) {
-      return videos.map(v => ({ ...v, score: 6, reasoning: "Rating unavailable" }));
+      const errBody = await res.text().catch(() => "");
+      console.error(`Video rating failed: ${res.status} ${errBody.slice(0, 400)}`);
+      // Rater error: mark as 'unrated' so caller (media-helpers) can decide whether
+      // to allow entity-matched candidates through instead of silently dropping.
+      return videos.map(v => ({ ...v, score: 0, reasoning: `unrated:rater_http_${res.status}` }));
     }
 
     const data = await res.json();
     const rawContent = data.choices?.[0]?.message?.content || "";
     const jsonMatch = rawContent.match(/\[[\s\S]*\]/);
     if (!jsonMatch) {
-      return videos.map(v => ({ ...v, score: 6, reasoning: "Parse error" }));
+      return videos.map(v => ({ ...v, score: 0, reasoning: "unrated:parse_error" }));
     }
 
     const ratings = JSON.parse(jsonMatch[0]) as Array<{ index: number; score: number; reasoning: string }>;
     return videos.map((v, i) => {
       const rating = ratings.find(r => r.index === i + 1);
-      return { ...v, score: rating?.score ?? 6, reasoning: rating?.reasoning ?? "No rating" };
+      return { ...v, score: rating?.score ?? 0, reasoning: rating?.reasoning ?? "unrated:no_rating" };
     });
   } catch (err) {
     console.error("Video rating error:", err);
-    return videos.map(v => ({ ...v, score: 6, reasoning: "Error" }));
+    return videos.map(v => ({ ...v, score: 0, reasoning: `unrated:exception:${err instanceof Error ? err.message : String(err)}` }));
   }
 }
 
@@ -286,6 +292,10 @@ Deno.serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // --- Auth guard (shared): valid user JWT or service-role key required ---
+  const authError = await requireAuth(req, corsHeaders);
+  if (authError) return authError;
+
   try {
     const { competitor, category, subCategory, mediaItems, existingVideoIds } = await req.json() as {
       competitor: string;
@@ -349,6 +359,10 @@ Deno.serve(async (req) => {
       /unsplash\.com/i,
       /pexels\.com/i,
       /stock[_-]?photo/i,
+      // Decorative stock illustrations (asset-name patterns)
+      /\b(lightbulb|light-bulb|innovation|brainstorm|idea[s]?-?graphic|abstract-?bg|hero-?image|banner-?bg)\b/i,
+      // Headshots / author / speaker portraits in asset-name
+      /\b(headshot|portrait|profile-?photo|team-?member|speaker|author-?photo)\b/i,
     ];
 
     const preFiltered: MediaItem[] = [];
@@ -400,15 +414,20 @@ Deno.serve(async (req) => {
     const allRated = [...imageRatings, ...videoRatings];
     const QUALITY_THRESHOLD = 7;
 
+    // Score 0 = unrated (rater error / parse error / exception). These are
+    // surfaced separately so callers can apply an entity-matched fallback
+    // instead of dropping the only relevant asset.
     const filteredMedia = allRated.filter(m => m.score >= QUALITY_THRESHOLD);
+    const unratedMedia = allRated.filter(m => m.score === 0);
     const rejectedMedia = [
-      ...allRated.filter(m => m.score < QUALITY_THRESHOLD),
+      ...allRated.filter(m => m.score > 0 && m.score < QUALITY_THRESHOLD),
       ...urlRejected.map(m => ({ ...m, score: 1, reasoning: "URL blocklist: non-product image pattern detected" })),
     ];
 
     console.log(`Media Quality Agent results:`);
     console.log(`  ✅ Passed (≥${QUALITY_THRESHOLD}): ${filteredMedia.length}`);
     console.log(`  ❌ Rejected (<${QUALITY_THRESHOLD}): ${rejectedMedia.length} (${urlRejected.length} URL pre-filtered)`);
+    console.log(`  ⚠️  Unrated (rater error): ${unratedMedia.length}`);
     console.log(`  🎥 Discovered YT videos: ${discoveredVideos.length}`);
 
     for (const m of filteredMedia) {
@@ -417,11 +436,14 @@ Deno.serve(async (req) => {
     for (const m of rejectedMedia) {
       console.log(`  ❌ [${m.score}/10] ${m.type}: ${m.label.slice(0, 80)} — ${m.reasoning}`);
     }
+    for (const m of unratedMedia) {
+      console.log(`  ⚠️ [unrated] ${m.type}: ${m.label.slice(0, 80)} — ${m.reasoning}`);
+    }
     for (const v of discoveredVideos) {
       console.log(`  🎥 [${v.score}/10] YT: ${v.title.slice(0, 80)}`);
     }
 
-    const result: MediaQualityResult = { filteredMedia, rejectedMedia, discoveredVideos };
+    const result: MediaQualityResult = { filteredMedia, rejectedMedia, unratedMedia, discoveredVideos };
 
     return new Response(JSON.stringify(result), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },

@@ -1,7 +1,8 @@
+import { useEffect, useState } from "react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { RefreshCw } from "lucide-react";
-import { getCategoryNames, getSubCategories, getSeedCompetitors } from "@/lib/seed-data";
+import { getCategoryNames, getSubCategories, getSeedCompetitors, ensureSeedDataLoaded } from "@/lib/seed-data";
 
 interface FilterBarProps {
   category: string;
@@ -24,6 +25,10 @@ const FilterBar = ({
   onRefresh,
   refreshing,
 }: FilterBarProps) => {
+  const [, setLoaded] = useState(0);
+  useEffect(() => {
+    ensureSeedDataLoaded().then(() => setLoaded((n) => n + 1));
+  }, []);
   const categoryNames = getCategoryNames();
   const subCategoryNames = category ? getSubCategories(category) : [];
   const competitors = category && subCategory ? getSeedCompetitors(category, subCategory) : [];

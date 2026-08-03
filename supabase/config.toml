@@ -44,3 +44,33 @@ verify_jwt = false
 
 [functions.migrate-cdn-to-storage]
 verify_jwt = false
+
+[functions.fetch-community]
+verify_jwt = false
+
+[functions.firecrawl-reddit]
+verify_jwt = false
+
+[functions.reddit-quality-gate]
+verify_jwt = false
+
+[functions.firecrawl-linkedin]
+verify_jwt = false
+
+[functions.fetch-news]
+verify_jwt = false
+
+[functions.news-discover]
+verify_jwt = false
+
+[functions.news-hydrate]
+verify_jwt = false
+
+[functions.news-finalize]
+verify_jwt = false
+
+[functions.ingest-adaptive-kb]
+verify_jwt = false
+
+[functions.Customer_exists]
+verify_jwt = false

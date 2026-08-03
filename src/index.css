@@ -2,51 +2,95 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ──────────────────────────────────────────────────────────
+   SENTINEL — Dark futuristic theme
+   "Competitive Intelligence, On Watch."
+   Palette: deep ink base, indigo midtones, electric cyan
+   primary, violet secondary. All HSL.
+   ────────────────────────────────────────────────────────── */
 @layer base {
   :root {
-    --background: 220 20% 7%;
-    --foreground: 210 20% 92%;
+    /* Surfaces */
+    --background: 224 40% 5%;          /* deep ink */
+    --foreground: 210 30% 94%;
 
-    --card: 220 18% 10%;
-    --card-foreground: 210 20% 92%;
+    --card: 224 32% 9%;
+    --card-foreground: 210 30% 94%;
 
-    --popover: 220 18% 10%;
-    --popover-foreground: 210 20% 92%;
+    --popover: 224 34% 9%;
+    --popover-foreground: 210 30% 94%;
 
-    --primary: 215 90% 58%;
-    --primary-foreground: 220 20% 7%;
+    /* Primary = electric cyan (sentinel "scan" color) */
+    --primary: 188 92% 54%;
+    --primary-foreground: 224 40% 6%;
 
-    --secondary: 220 16% 16%;
-    --secondary-foreground: 210 20% 88%;
+    /* Secondary surface */
+    --secondary: 230 28% 14%;
+    --secondary-foreground: 210 26% 90%;
 
-    --muted: 220 14% 14%;
-    --muted-foreground: 215 12% 55%;
+    --muted: 226 24% 12%;
+    --muted-foreground: 220 14% 62%;
 
-    --accent: 215 80% 52%;
-    --accent-foreground: 220 20% 98%;
+    /* Accent = violet (guardian) */
+    --accent: 258 80% 66%;
+    --accent-foreground: 224 40% 6%;
 
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 210 20% 98%;
+    --destructive: 0 75% 55%;
+    --destructive-foreground: 210 30% 98%;
 
-    --border: 220 14% 18%;
-    --input: 220 14% 18%;
-    --ring: 215 90% 58%;
+    --border: 224 28% 18%;
+    --input: 224 28% 16%;
+    --ring: 188 92% 54%;
 
-    --radius: 0.5rem;
+    --radius: 0.625rem;
 
-    --sidebar-background: 220 20% 5%;
-    --sidebar-foreground: 210 14% 80%;
-    --sidebar-primary: 215 90% 58%;
-    --sidebar-primary-foreground: 220 20% 98%;
-    --sidebar-accent: 220 16% 12%;
-    --sidebar-accent-foreground: 210 14% 80%;
-    --sidebar-border: 220 14% 14%;
-    --sidebar-ring: 215 90% 58%;
+    /* Sidebar */
+    --sidebar-background: 224 44% 4%;
+    --sidebar-foreground: 215 18% 78%;
+    --sidebar-primary: 188 92% 54%;
+    --sidebar-primary-foreground: 224 40% 6%;
+    --sidebar-accent: 226 30% 11%;
+    --sidebar-accent-foreground: 215 18% 82%;
+    --sidebar-border: 224 28% 12%;
+    --sidebar-ring: 188 92% 54%;
 
-    --success: 142 70% 45%;
-    --warning: 38 92% 50%;
-    --glow-primary: 215 90% 58%;
-    --glow-accent: 215 80% 52%;
+    /* Status */
+    --success: 152 72% 48%;
+    --warning: 38 96% 56%;
+
+    /* Sentinel signal colors */
+    --glow-primary: 188 92% 54%;       /* cyan scan */
+    --glow-accent: 258 80% 66%;        /* violet guardian */
+    --signal: 188 100% 62%;
+    --signal-soft: 258 80% 66%;
+
+    /* Gradients (used in components & backgrounds) */
+    --gradient-aurora: radial-gradient(
+        ellipse 80% 60% at 20% 0%,
+        hsl(258 80% 35% / 0.35),
+        transparent 60%
+      ),
+      radial-gradient(
+        ellipse 70% 50% at 85% 10%,
+        hsl(188 90% 35% / 0.28),
+        transparent 65%
+      ),
+      radial-gradient(
+        ellipse 60% 40% at 50% 100%,
+        hsl(230 70% 30% / 0.30),
+        transparent 70%
+      );
+    --gradient-signal: linear-gradient(
+      135deg,
+      hsl(188 92% 54%) 0%,
+      hsl(258 80% 66%) 100%
+    );
+    --gradient-text-signal: linear-gradient(
+      90deg,
+      hsl(188 100% 70%) 0%,
+      hsl(258 90% 78%) 50%,
+      hsl(188 100% 70%) 100%
+    );
   }
 }
 
@@ -59,78 +103,182 @@
     @apply bg-background text-foreground antialiased;
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
   }
+
+  /* Selection uses signal color */
+  ::selection {
+    background: hsl(var(--primary) / 0.35);
+    color: hsl(var(--foreground));
+  }
 }
 
-/* ── Ambient glow animations ── */
+/* ── Sentinel translucent surfaces (global glass vibe) ── */
+@layer components {
+  .bg-card {
+    background-color: hsl(var(--card) / 0.55) !important;
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    border-color: hsl(var(--border) / 0.6);
+  }
+  .bg-popover {
+    background-color: hsl(var(--popover) / 0.78) !important;
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+  }
+  .bg-sidebar,
+  [data-sidebar="sidebar"] {
+    background-color: hsl(var(--sidebar-background) / 0.65) !important;
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+  }
+  .glass-panel {
+    background-color: hsl(var(--card) / 0.45);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+    border: 1px solid hsl(var(--border) / 0.55);
+  }
+}
+
+/* ── Sentinel ambient animations ───────────────────── */
 @keyframes glow-pulse {
-  0%, 100% { box-shadow: 0 0 8px 0 hsl(var(--glow-primary) / 0.15); }
-  50% { box-shadow: 0 0 20px 4px hsl(var(--glow-primary) / 0.25); }
+  0%, 100% { box-shadow: 0 0 10px 0 hsl(var(--glow-primary) / 0.20); }
+  50%      { box-shadow: 0 0 24px 6px hsl(var(--glow-primary) / 0.35); }
 }
 
 @keyframes glow-breathe {
-  0%, 100% { opacity: 0.4; }
-  50% { opacity: 0.8; }
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 0.85; }
 }
 
 @keyframes glow-border {
   0%, 100% { border-color: hsl(var(--border)); }
-  50% { border-color: hsl(var(--glow-primary) / 0.4); }
+  50%      { border-color: hsl(var(--glow-primary) / 0.55); }
 }
 
 @keyframes subtle-float {
   0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-2px); }
+  50%      { transform: translateY(-2px); }
 }
 
 @keyframes shimmer {
-  0% { background-position: -200% 0; }
+  0%   { background-position: -200% 0; }
   100% { background-position: 200% 0; }
 }
 
 @keyframes orb-drift {
-  0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.12; }
-  33% { transform: translate(10px, -8px) scale(1.05); opacity: 0.18; }
-  66% { transform: translate(-6px, 4px) scale(0.97); opacity: 0.1; }
+  0%, 100% { transform: translate(0, 0) scale(1);    opacity: 0.18; }
+  33%      { transform: translate(14px, -12px) scale(1.06); opacity: 0.28; }
+  66%      { transform: translate(-10px, 8px) scale(0.96); opacity: 0.14; }
 }
 
-.glow-pulse {
-  animation: glow-pulse 3s ease-in-out infinite;
+/* Sentinel-specific: horizontal scan sweep */
+@keyframes scan-sweep {
+  0%   { transform: translateX(-30%); opacity: 0; }
+  10%  { opacity: 0.6; }
+  50%  { opacity: 0.8; }
+  90%  { opacity: 0.4; }
+  100% { transform: translateX(130%); opacity: 0; }
 }
 
-.glow-breathe {
-  animation: glow-breathe 4s ease-in-out infinite;
+/* Sentinel-specific: aurora drift */
+@keyframes aurora-drift {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50%      { transform: translate3d(2%, -1%, 0) scale(1.05); }
 }
 
-.glow-border {
-  animation: glow-border 4s ease-in-out infinite;
+/* Sentinel-specific: radar ring expansion */
+@keyframes radar-pulse {
+  0%   { transform: scale(0.6); opacity: 0.6; }
+  100% { transform: scale(2.6); opacity: 0; }
 }
 
-.subtle-float {
-  animation: subtle-float 6s ease-in-out infinite;
+/* Click ripple */
+@keyframes ripple {
+  0%   { transform: scale(0); opacity: 0.45; }
+  100% { transform: scale(2.4); opacity: 0; }
 }
+
+/* Heading text shimmer */
+@keyframes text-signal {
+  0%   { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+/* Utility classes */
+.glow-pulse    { animation: glow-pulse 3s ease-in-out infinite; }
+.glow-breathe  { animation: glow-breathe 4s ease-in-out infinite; }
+.glow-border   { animation: glow-border 4s ease-in-out infinite; }
+.subtle-float  { animation: subtle-float 6s ease-in-out infinite; }
+.orb-drift     { animation: orb-drift 12s ease-in-out infinite; }
+.aurora-drift  { animation: aurora-drift 18s ease-in-out infinite; }
 
 .shimmer-bg {
   background: linear-gradient(
     90deg,
     hsl(var(--glow-primary) / 0) 0%,
-    hsl(var(--glow-primary) / 0.08) 50%,
+    hsl(var(--glow-primary) / 0.10) 50%,
     hsl(var(--glow-primary) / 0) 100%
   );
   background-size: 200% 100%;
   animation: shimmer 8s ease-in-out infinite;
 }
 
-.orb-drift {
-  animation: orb-drift 12s ease-in-out infinite;
+/* Sentinel signal text — animated gradient wordmark */
+.text-signal {
+  background-image: var(--gradient-text-signal);
+  background-size: 200% auto;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: text-signal 6s linear infinite;
 }
 
-/* Active card glow on hover */
+/* Aurora background layer (sits over starfield) */
+.sentinel-aurora {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: var(--gradient-aurora);
+  filter: blur(40px);
+  opacity: 0.85;
+  z-index: 0;
+  animation: aurora-drift 18s ease-in-out infinite;
+}
+
+/* Horizontal scan line that sweeps across hero areas */
+.scan-line {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  border-radius: inherit;
+}
+.scan-line::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 30%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    hsl(var(--signal) / 0.10) 30%,
+    hsl(var(--signal) / 0.35) 50%,
+    hsl(var(--signal) / 0.10) 70%,
+    transparent 100%
+  );
+  filter: blur(8px);
+  animation: scan-sweep 7s ease-in-out infinite;
+}
+
+/* Card hover glow */
 .card-glow {
-  transition: box-shadow 0.4s ease, border-color 0.4s ease;
+  transition: box-shadow 0.4s ease, border-color 0.4s ease, transform 0.4s ease;
 }
 .card-glow:hover {
-  box-shadow: 0 0 24px -4px hsl(var(--glow-primary) / 0.2);
-  border-color: hsl(var(--glow-primary) / 0.3);
+  box-shadow: 0 0 32px -4px hsl(var(--glow-primary) / 0.30);
+  border-color: hsl(var(--glow-primary) / 0.45);
+  transform: translateY(-1px);
 }
 
 /* Alive dot indicator */
@@ -144,20 +292,57 @@
   width: 6px; height: 6px;
   border-radius: 50%;
   background: hsl(var(--glow-primary));
+  box-shadow: 0 0 8px hsl(var(--glow-primary) / 0.7);
   animation: glow-breathe 2s ease-in-out infinite;
 }
 
+/* Radar pulse ring (e.g. around avatars/buttons) */
+.radar-ring {
+  position: relative;
+}
+.radar-ring::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 9999px;
+  border: 1px solid hsl(var(--signal) / 0.55);
+  animation: radar-pulse 2.4s ease-out infinite;
+  pointer-events: none;
+}
+
+/* Click ripple — applied via data-ripple in main.tsx */
+.sentinel-ripple {
+  position: absolute;
+  border-radius: 9999px;
+  background: hsl(var(--signal) / 0.4);
+  pointer-events: none;
+  transform: scale(0);
+  animation: ripple 600ms ease-out forwards;
+  mix-blend-mode: screen;
+}
+
 /* Custom scrollbar */
-::-webkit-scrollbar {
-  width: 6px;
-}
-::-webkit-scrollbar-track {
-  background: hsl(var(--background));
-}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: hsl(var(--background)); }
 ::-webkit-scrollbar-thumb {
-  background: hsl(var(--border));
+  background: linear-gradient(
+    180deg,
+    hsl(var(--primary) / 0.45),
+    hsl(var(--accent) / 0.45)
+  );
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: hsl(var(--muted-foreground));
+  background: linear-gradient(
+    180deg,
+    hsl(var(--primary) / 0.7),
+    hsl(var(--accent) / 0.7)
+  );
+}
+
+/* Focus ring polish */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring) / 0.7);
+  outline-offset: 2px;
+  border-radius: 4px;
 }

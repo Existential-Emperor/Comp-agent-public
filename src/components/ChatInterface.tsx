@@ -1,19 +1,27 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { ThumbsUp, ThumbsDown, Copy, Send, Loader2, Rocket, Square, X, Download, Presentation, UserCircle } from "lucide-react";
+import { ThumbsUp, ThumbsDown, Copy, Send, Loader2, Rocket, Square, X, Download, Presentation, UserCircle, MessageSquare, SlidersHorizontal, Check } from "lucide-react";
 import { useBotAvatar } from "@/hooks/useBotAvatar";
+import { useCompletionNotification } from "@/hooks/useCompletionNotification";
+import { supabase } from "@/integrations/supabase/client";
 import { useUserAvatar } from "@/hooks/useUserAvatar";
-import FormattedResponse from "@/components/FormattedResponse";
+import FormattedResponse, { type VisualMediaItem } from "@/components/FormattedResponse";
 
 import { useToast } from "@/hooks/use-toast";
+import { copyToClipboard } from "@/lib/clipboard";
 import { getCategoryNames, getSubCategories } from "@/lib/seed-data";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Checkbox } from "@/components/ui/checkbox";
-import { downloadAsDoc, generateSwotSlides, extractCompetitorNames } from "@/lib/export-utils";
+import { downloadAsDoc, extractCompetitorNames } from "@/lib/export-utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { messageVariants, fadeInUp, scaleIn } from "@/lib/animations";
+
+const PREDEFINED_COMPETITORS = [
+  "Vena", "Anaplan", "Oracle EPM", "Pigment", "Planful", "SAP", "OneStream",
+];
 
 interface Message {
   id: string;
@@ -21,7 +29,14 @@ interface Message {
   content: string;
   created_at: string;
   metadata?: any;
+  /** Stable render identity that survives the streaming→final promotion. */
+  clientKey?: string;
+  /** True while tokens are still streaming into this bubble. */
+  isStreaming?: boolean;
+  /** Structured Visual Overview media (decoupled `media` SSE channel). */
+  media?: VisualMediaItem[];
 }
+
 
 interface ChatInterfaceProps {
   messages: Message[];
@@ -40,6 +55,10 @@ interface ChatInterfaceProps {
   onCompetitorsChange: (v: string[]) => void;
   refreshing?: boolean;
   onLetsGo?: () => void;
+  onDiscoverCompetitors?: () => void;
+  discoveredCompetitors?: { name: string; website: string; description: string }[];
+  traceIds?: Record<string, string>;
+  progress?: string;
 }
 
 const THINKING_STEPS = [
@@ -82,8 +101,20 @@ const ChatInterface = ({
   onCompetitorsChange,
   refreshing,
   onLetsGo,
+  onDiscoverCompetitors,
+  discoveredCompetitors = [],
+  traceIds = {},
+  progress,
 }: ChatInterfaceProps) => {
   const [input, setInput] = useState("");
+  const [directChatMode, setDirectChatMode] = useState(false);
+  const [feedbackOpenFor, setFeedbackOpenFor] = useState<string | null>(null);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackOriginalText, setFeedbackOriginalText] = useState("");
+  const [feedbackSaving, setFeedbackSaving] = useState(false);
+  const [feedbackLoading, setFeedbackLoading] = useState(false);
+  const [feedbackExisted, setFeedbackExisted] = useState(false);
+  const [feedbackVotes, setFeedbackVotes] = useState<Record<string, "like" | "dislike" | null>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
@@ -93,6 +124,7 @@ const ChatInterface = ({
   const [competitorPopoverOpen, setCompetitorPopoverOpen] = useState(false);
   const botAvatarImg = useBotAvatar();
   const { avatarUrl: userAvatarUrl } = useUserAvatar();
+  const { armPermission } = useCompletionNotification(loading);
 
   const categoryNames = getCategoryNames();
   const subCategoryNames = category ? getSubCategories(category) : [];
@@ -125,30 +157,138 @@ const ChatInterface = ({
     return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   }, []);
 
+  // Autoscroll WITHOUT layout thrash. The previous implementation called
+  // scrollIntoView({behavior:"smooth"}) on every streamed flush (~60/s). Each
+  // call restarts a smooth-scroll animation that fires `scroll` events, whose
+  // handler synchronously reads scrollHeight/scrollTop (forcing a full reflow of
+  // a huge, image-heavy, still-growing DOM). Write→scroll→read→reflow at 60/s on
+  // the largest document at end-of-stream saturates the main thread — the
+  // "Page Unresponsive"/"stuck at the end" freeze. Fix: coalesce to at most one
+  // scroll per animation frame and do a single INSTANT write (no smooth
+  // animation, no animation-driven scroll-event storm).
+  const scrollRafRef = useRef<number | null>(null);
   const scrollToBottom = useCallback(() => {
-    if (!userScrolledUpRef.current) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
+    if (userScrolledUpRef.current) return;
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
   }, []);
 
   useEffect(() => {
     scrollToBottom();
   }, [messages, loading, scrollToBottom]);
 
+  useEffect(() => () => {
+    if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current);
+  }, []);
+
+  const hasWarnedNotificationBlockRef = useRef(false);
   const handleSend = () => {
     if (!input.trim()) return;
+    void armPermission().then((result) => {
+      if (result === "embedded" && !hasWarnedNotificationBlockRef.current) {
+        hasWarnedNotificationBlockRef.current = true;
+        toast({
+          title: "Notifications blocked in preview",
+          description: "Open the published app directly to enable browser notifications.",
+        });
+      } else if (result === "denied" && !hasWarnedNotificationBlockRef.current) {
+        hasWarnedNotificationBlockRef.current = true;
+        toast({
+          title: "Notifications are blocked",
+          description: "Enable browser notifications for this site in your browser settings.",
+        });
+      }
+    });
     onSendMessage(input.trim());
     setInput("");
   };
 
-  const handleCopy = (content: string) => {
-    navigator.clipboard.writeText(content);
-    toast({ title: "Copied to clipboard" });
+  const handleCopy = async (content: string) => {
+    const ok = await copyToClipboard(content);
+    toast({
+      title: ok ? "Copied to clipboard" : "Copy failed",
+      description: ok ? undefined : "Your browser blocked clipboard access.",
+      variant: ok ? undefined : "destructive",
+    });
   };
 
   const handleDownload = (content: string) => {
     downloadAsDoc(content, "Comp_Agent_Analysis");
     toast({ title: "Downloading document..." });
+  };
+
+  const isTransientAssistantMessage = (msgId: string) =>
+    msgId.startsWith("streaming-") || msgId.startsWith("cancel-");
+
+  const resolveTraceId = async (msgId: string): Promise<string | null> => {
+    // 1. Check the traceIds map passed from Dashboard (fastest, most reliable)
+    if (traceIds[msgId]) return traceIds[msgId];
+    // 2. Check in-memory message metadata
+    const msg = messages.find((m) => m.id === msgId);
+    if (msg?.metadata?.trace_id) return msg.metadata.trace_id;
+    // 3. Last resort: query agent_traces table by message_id
+    const { data } = await supabase
+      .from("agent_traces")
+      .select("id")
+      .eq("message_id", msgId)
+      .maybeSingle();
+    return data?.id ?? null;
+  };
+
+  const handleFeedbackComment = async (msgId: string) => {
+    if (isTransientAssistantMessage(msgId) || !feedbackText.trim()) return;
+    setFeedbackSaving(true);
+    try {
+      const traceId = await resolveTraceId(msgId);
+      if (!traceId) {
+        toast({ title: "No trace linked", description: "Cannot save feedback for this message.", variant: "destructive" });
+        return;
+      }
+      const { error } = await supabase.functions.invoke("trace-feedback", {
+        body: { trace_id: traceId, feedback_comment: feedbackText.trim() },
+      });
+      if (error) throw new Error(error.message);
+      toast({ title: "Feedback saved" });
+      setFeedbackOriginalText(feedbackText.trim());
+      setFeedbackExisted(true);
+      // Auto-close the feedback field after saving
+      setFeedbackOpenFor(null);
+      setFeedbackText("");
+    } catch {
+      toast({ title: "Failed to save feedback", variant: "destructive" });
+    } finally {
+      setFeedbackSaving(false);
+    }
+  };
+
+  const handleVote = async (msgId: string, vote: "like" | "dislike") => {
+    if (isTransientAssistantMessage(msgId)) return;
+
+    const msg = messages.find((m) => m.id === msgId);
+    const traceId = msg?.metadata?.trace_id;
+    const currentVote = feedbackVotes[msgId] ?? null;
+    const newVote = currentVote === vote ? null : vote;
+
+    setFeedbackVotes((prev) => ({ ...prev, [msgId]: newVote }));
+
+    const resolvedTraceId = traceIds[msgId] || traceId || (await resolveTraceId(msgId));
+    if (resolvedTraceId) {
+      void supabase.functions.invoke("trace-feedback", {
+        body: { trace_id: resolvedTraceId, feedback_vote: newVote },
+      });
+    }
+
+    if (newVote) {
+      toast({ title: "Feedback recorded" });
+    } else {
+      toast({ title: "Feedback removed" });
+    }
+
+    onFeedback(msgId, vote);
   };
 
   const [slidesLoading, setSlidesLoading] = useState<string | null>(null);
@@ -164,35 +304,19 @@ const ChatInterface = ({
       const messageCompNames = extractCompetitorNames(content, metadata);
       const contextCompNames = contextPrompt ? extractCompetitorNames(contextPrompt) : [];
       const finalCompNames = Array.from(new Set([...messageCompNames, ...contextCompNames])).filter(Boolean);
-      const contextLabel = contextPrompt.length > 0
-        ? (contextPrompt.length > 90 ? `${contextPrompt.slice(0, 87)}...` : contextPrompt)
-        : "Competitive Analysis";
+      const contextLabel = contextPrompt || "Competitive Analysis";
 
-      // Detect if content has SWOT structure; if not, use generic feed slides
-      const hasSwotStructure = /\b(strengths?|weaknesses?|opportunities|threats)\b/i.test(content) &&
-        [/strength/i, /weakness|limitation/i, /opportunit/i, /threat|risk/i].filter(r => r.test(content)).length >= 3;
-
-      if (hasSwotStructure) {
-        await generateSwotSlides(
-          content,
-          finalCompNames.length > 0 ? finalCompNames : ["Analysis"],
-          contextLabel,
-          "",
-          { messageId: msgId, traceId: metadata?.trace_id, traceMetadata: metadata },
-        );
-      } else {
-        const { generateFeedSlides } = await import("@/lib/export-utils");
-        const title = contextLabel || "Competitive Analysis";
-        await generateFeedSlides(content, title, {
-          messageId: msgId,
-          traceId: metadata?.trace_id,
-          traceMetadata: metadata,
-        }, 'comp');
-      }
-      toast({ title: "Slides generated!", description: "Check your downloads folder." });
+      const { generateFeedSlides } = await import("@/lib/export-utils");
+      const title = contextLabel || "Competitive Analysis";
+      await generateFeedSlides(content, title, {
+        messageId: msgId,
+        traceId: metadata?.trace_id,
+        traceMetadata: metadata,
+      }, 'comp');
+      (await import("sonner")).toast.success("Slides generated! Check your downloads folder.", { duration: 2000 });
     } catch (err) {
       console.error("Slide generation error:", err);
-      toast({ title: "Failed to generate slides", variant: "destructive" });
+      (await import("sonner")).toast.error("Failed to generate slides", { duration: 3000 });
     } finally {
       setSlidesLoading(null);
     }
@@ -201,7 +325,7 @@ const ChatInterface = ({
   const toggleCompetitor = (name: string) => {
     if (selectedCompetitors.includes(name)) {
       onCompetitorsChange(selectedCompetitors.filter(c => c !== name));
-    } else if (selectedCompetitors.length < 3) {
+    } else if (selectedCompetitors.length < 2) {
       onCompetitorsChange([...selectedCompetitors, name]);
     }
   };
@@ -209,8 +333,15 @@ const ChatInterface = ({
   const isFullProduct = category === "Full Product";
   const hasContext = category && subCategory && selectedCompetitors.length > 0;
   const hasStarted = messages.length > 0 || loading || threadLoading;
-  const showLetsGo = !hasStarted;
-  const showChatInput = hasStarted;
+  // Hide selectors for direct/general chats. Once a conversation has started
+  // without a real Charter (i.e. "General" general query), keep selectors hidden
+  // — both for the active session and when re-opening past general threads.
+  const isGeneralThread = !category || category === "General";
+  const showSelectors = !directChatMode && (!hasStarted || !isGeneralThread);
+  const showLetsGo = !hasStarted && !directChatMode;
+  const showChatInput = hasStarted || directChatMode;
+  const showToggle = !hasStarted; // toggle disappears after first message
+  
 
   const competitorLabel = selectedCompetitors.length === 0
     ? (refreshing ? "Discovering..." : "Competitor(s)")
@@ -219,26 +350,11 @@ const ChatInterface = ({
       : `${selectedCompetitors.length} selected`;
 
   return (
-    <div className="relative flex h-full flex-col">
-      
-      <div className="relative flex-1 overflow-y-auto p-4" ref={scrollRef} onScroll={() => { userScrolledUpRef.current = !isNearBottom(); }}>
-        {!hasContext && messages.length === 0 && (
+    <div className="relative flex h-full flex-col overflow-hidden bg-transparent">
+      <div className="relative z-10 flex-1 overflow-y-auto p-4" ref={scrollRef} onScroll={() => { userScrolledUpRef.current = !isNearBottom(); }}>
+        {messages.length === 0 && (!hasContext || directChatMode) && (
           <div className="relative flex h-full items-center justify-center overflow-hidden">
-            {/* Ambient orbs */}
-            <div className="pointer-events-none absolute inset-0">
-              <div
-                className="absolute left-1/4 top-1/3 h-64 w-64 rounded-full orb-drift"
-                style={{ background: "radial-gradient(circle, hsl(var(--glow-primary) / 0.15) 0%, transparent 70%)" }}
-              />
-              <div
-                className="absolute right-1/4 bottom-1/3 h-48 w-48 rounded-full orb-drift"
-                style={{ background: "radial-gradient(circle, hsl(var(--glow-accent) / 0.12) 0%, transparent 70%)", animationDelay: "4s" }}
-              />
-              <div
-                className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-80 w-80 rounded-full orb-drift"
-                style={{ background: "radial-gradient(circle, hsl(var(--glow-primary) / 0.08) 0%, transparent 65%)", animationDelay: "8s" }}
-              />
-            </div>
+
 
             <motion.div
               className="relative z-10 text-center space-y-3 max-w-md"
@@ -258,7 +374,7 @@ const ChatInterface = ({
                 Comp Intelligence Agent
               </h3>
               <p className="text-sm text-muted-foreground">
-                Select a Category, Sub-Category, and up to 3 Competitors from the input area below to generate a competitive analysis.
+                Select a Category, Sub-Category, and up to 3 Competitors from the input area below to generate a competitive analysis or simply toggle to chat directly.
               </p>
             </motion.div>
           </div>
@@ -268,7 +384,7 @@ const ChatInterface = ({
           <AnimatePresence initial={false}>
             {messages.map((msg) => (
               <motion.div
-                key={msg.id}
+                key={msg.clientKey ?? msg.id}
                 className={`flex gap-3 ${msg.role === "user" ? "justify-end" : ""}`}
                 initial={{ opacity: 1 }}
                 animate={{ opacity: 1 }}
@@ -279,52 +395,129 @@ const ChatInterface = ({
                   </div>
                 )}
                 <div
-                  className={`max-w-[85%] rounded-lg px-4 py-3 text-sm leading-relaxed ${
+                  className={
                     msg.role === "user"
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-card border border-border card-glow"
-                  }`}
+                      ? "max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed bg-primary/90 text-primary-foreground border border-primary/30 shadow-md shadow-primary/20"
+                      : "max-w-[85%] rounded-2xl text-sm leading-relaxed bg-background/85 border-border/60 card-glow glow-pulse px-[16px] pt-4 pb-3 border shadow-sm opacity-90"
+                  }
                 >
                   {msg.role === "assistant" ? (
-                    <FormattedResponse content={msg.content} />
+                    <FormattedResponse content={msg.content} media={msg.media} />
                   ) : (
                     <div className="whitespace-pre-wrap">{msg.content}</div>
                   )}
 
-                  {msg.role === "assistant" && (
+                  {msg.role === "assistant" && !msg.isStreaming && !msg.id.startsWith("streaming-") && !msg.id.startsWith("cancel-") && (
                     <motion.div
-                      className="mt-3 flex items-center gap-1 border-t border-border pt-2"
+                      className="mt-3 border-t border-border pt-2 space-y-2"
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
                       transition={{ delay: 0.3 }}
                     >
-                      <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-accent" onClick={() => onFeedback(msg.id, "like")}>
-                        <ThumbsUp className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-destructive" onClick={() => onFeedback(msg.id, "dislike")}>
-                        <ThumbsDown className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={() => handleCopy(msg.content)}>
-                        <Copy className="h-3.5 w-3.5" />
-                      </Button>
-                      <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={() => handleDownload(msg.content)} title="Download as Doc">
-                        <Download className="h-3.5 w-3.5" />
-                      </Button>
+                      <div className="flex items-center gap-1">
                       <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 gap-1.5 text-xs text-muted-foreground hover:text-foreground ml-1"
-                        onClick={() => handleGenerateSlides(msg.content, msg.id, msg.metadata)}
-                        disabled={slidesLoading === msg.id}
-                        title="Generate Slides"
-                      >
-                        {slidesLoading === msg.id ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <Presentation className="h-3.5 w-3.5" />
-                        )}
-                        Slides
-                      </Button>
+                          variant="ghost"
+                          size="icon"
+                          className={`h-7 w-7 ${feedbackOpenFor === msg.id ? "text-accent" : "text-muted-foreground"} hover:text-accent`}
+                          onClick={async () => {
+                            if (feedbackOpenFor === msg.id) {
+                              setFeedbackOpenFor(null);
+                              setFeedbackText("");
+                              setFeedbackOriginalText("");
+                              setFeedbackExisted(false);
+                            } else {
+                              setFeedbackOpenFor(msg.id);
+                              setFeedbackText("");
+                              setFeedbackOriginalText("");
+                              setFeedbackExisted(false);
+                              const traceId = msg.metadata?.trace_id || (await resolveTraceId(msg.id));
+                              if (traceId) {
+                                setFeedbackLoading(true);
+                                try {
+                                  const { data } = await supabase
+                                    .from("agent_traces")
+                                    .select("feedback_comment, feedback_vote")
+                                    .eq("id", traceId)
+                                    .single();
+                                  if (data?.feedback_comment) {
+                                    setFeedbackText(data.feedback_comment);
+                                    setFeedbackOriginalText(data.feedback_comment);
+                                    setFeedbackExisted(true);
+                                  }
+                                  if (data?.feedback_vote) {
+                                    setFeedbackVotes((prev) => ({ ...prev, [msg.id]: data.feedback_vote as "like" | "dislike" }));
+                                  }
+                                } catch {}
+                                setFeedbackLoading(false);
+                              }
+                              // Scroll the feedback area into view after a tick
+                              setTimeout(() => {
+                                const el = document.getElementById(`feedback-${msg.id}`);
+                                el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                              }, 100);
+                            }
+                          }}
+                          title="Add feedback comment"
+                        >
+                          <span className="text-sm">💬</span>
+                        </Button>
+                        <Button variant="ghost" size="icon" className={`h-7 w-7 ${feedbackVotes[msg.id] === "like" ? "text-accent" : "text-muted-foreground"} hover:text-accent`} onClick={() => handleVote(msg.id, "like")}>
+                          <ThumbsUp className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button variant="ghost" size="icon" className={`h-7 w-7 ${feedbackVotes[msg.id] === "dislike" ? "text-destructive" : "text-muted-foreground"} hover:text-destructive`} onClick={() => handleVote(msg.id, "dislike")}>
+                          <ThumbsDown className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={() => handleCopy(msg.content)}>
+                          <Copy className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={() => handleDownload(msg.content)} title="Download as Doc">
+                          <Download className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 gap-1.5 text-xs text-muted-foreground hover:text-foreground ml-1"
+                          onClick={() => handleGenerateSlides(msg.content, msg.id, msg.metadata)}
+                          disabled={slidesLoading === msg.id}
+                          title="Generate Slides"
+                        >
+                          {slidesLoading === msg.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Presentation className="h-3.5 w-3.5" />
+                          )}
+                          Slides
+                        </Button>
+                      </div>
+                      {feedbackOpenFor === msg.id && (
+                        <div id={`feedback-${msg.id}`} className="flex items-start gap-2">
+                          {feedbackLoading ? (
+                            <div className="flex items-center gap-2 text-xs text-muted-foreground py-2">
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                              Loading feedback...
+                            </div>
+                          ) : (
+                            <>
+                              <Textarea
+                                placeholder="Write your feedback about this response..."
+                                value={feedbackText}
+                                onChange={(e) => setFeedbackText(e.target.value)}
+                                className="min-h-[60px] text-xs resize-none flex-1"
+                                rows={2}
+                              />
+                              <Button
+                                size="sm"
+                                className="h-8 gap-1 text-xs"
+                                onClick={() => handleFeedbackComment(msg.id)}
+                                disabled={feedbackSaving || !feedbackText.trim() || (feedbackExisted && feedbackText.trim() === feedbackOriginalText)}
+                              >
+                                {feedbackSaving ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+                                {feedbackExisted ? "Update" : "Save"}
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </motion.div>
                   )}
                 </div>
@@ -373,13 +566,13 @@ const ChatInterface = ({
                   <Loader2 className="h-4 w-4 animate-spin" />
                   <AnimatePresence mode="wait">
                     <motion.span
-                      key={thinkingIndex}
+                      key={progress || `thinking-${thinkingIndex}`}
                       initial={{ opacity: 0, y: 6 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: -6 }}
                       transition={{ duration: 0.2 }}
                     >
-                      {THINKING_STEPS[thinkingIndex]}
+                      {progress || THINKING_STEPS[thinkingIndex]}
                     </motion.span>
                   </AnimatePresence>
                   <Button variant="ghost" size="sm" className="ml-2 h-6 gap-1 text-xs text-destructive hover:text-destructive" onClick={onStop}>
@@ -395,125 +588,194 @@ const ChatInterface = ({
         </div>
       </div>
 
-      <motion.div
-        className="border-t border-border p-4"
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.15, duration: 0.3 }}
-      >
+
+
+      <div className="border-t border-border p-4">
         <div className="mx-auto max-w-4xl space-y-3">
-          <div className="flex items-center gap-2 flex-wrap">
-            <Select value={category} onValueChange={onCategoryChange} disabled={hasStarted}>
-              <SelectTrigger className="h-8 w-[180px] bg-background/50 text-xs">
-                <SelectValue placeholder="Charters" />
-              </SelectTrigger>
-              <SelectContent>
-                {categoryNames.map((c) => (
-                  <SelectItem key={c} value={c}>{c}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          {/* Mode toggle — disappears after first message */}
+          {showToggle && (
+            <div className="inline-flex items-center rounded-full bg-muted p-0.5">
+              <button
+                onClick={() => setDirectChatMode(false)}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-all ${
+                  !directChatMode
+                    ? "bg-primary text-primary-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <SlidersHorizontal className="h-3 w-3" />
+                Use Selectors
+              </button>
+              <button
+                onClick={() => setDirectChatMode(true)}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-all ${
+                  directChatMode
+                    ? "bg-primary text-primary-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <MessageSquare className="h-3 w-3" />
+                Chat Directly
+              </button>
+            </div>
+          )}
 
-            <Select value={subCategory} onValueChange={onSubCategoryChange} disabled={!category || hasStarted || isFullProduct}>
-              <SelectTrigger className="h-8 w-[200px] bg-background/50 text-xs">
-                <SelectValue placeholder="Product Areas" />
-              </SelectTrigger>
-              <SelectContent>
-                {subCategoryNames.map((sc) => (
-                  <SelectItem key={sc} value={sc}>{sc}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            <Popover open={competitorPopoverOpen} onOpenChange={setCompetitorPopoverOpen}>
-              <PopoverTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8 w-[200px] justify-between bg-background/50 text-xs font-normal"
-                  disabled={!subCategory || refreshing || hasStarted}
-                >
-                  <span className="truncate">{competitorLabel}</span>
-                  {selectedCompetitors.length > 0 && !hasStarted && (
-                    <span className="ml-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-[10px] text-primary-foreground">
-                      {selectedCompetitors.length}
-                    </span>
-                  )}
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent className="w-[220px] p-2" align="start">
-                <div className="mb-2 px-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                  Select up to 3 competitors
-                </div>
-                <div className="max-h-48 overflow-y-auto space-y-0.5">
-                  {competitors.map((comp) => {
-                    const checked = selectedCompetitors.includes(comp.name);
-                    const disabled = !checked && selectedCompetitors.length >= 3;
-                    return (
-                      <button
-                        key={comp.name}
-                        onClick={() => toggleCompetitor(comp.name)}
-                        disabled={disabled}
-                        className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors ${
-                          checked ? "bg-primary/10 text-foreground" : disabled ? "opacity-40 cursor-not-allowed" : "hover:bg-muted text-foreground"
-                        }`}
-                      >
-                        <Checkbox checked={checked} className="h-3.5 w-3.5" tabIndex={-1} />
-                        <span className="truncate">{comp.name}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-                {selectedCompetitors.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1 border-t border-border pt-2">
-                    {selectedCompetitors.map(name => (
-                      <span key={name} className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-foreground">
-                        {name}
-                        <button onClick={() => toggleCompetitor(name)} className="hover:text-destructive">
-                          <X className="h-2.5 w-2.5" />
-                        </button>
-                      </span>
+          {/* Selectors row — only rendered when in selector mode or after conversation started */}
+          {showSelectors && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap">
+                <Select value={category} onValueChange={onCategoryChange} disabled={hasStarted}>
+                  <SelectTrigger className="h-8 w-[180px] bg-background/50 text-xs">
+                    <SelectValue placeholder="Charters" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {categoryNames.map((c) => (
+                      <SelectItem key={c} value={c}>{c}</SelectItem>
                     ))}
-                  </div>
-                )}
-              </PopoverContent>
-            </Popover>
+                  </SelectContent>
+                </Select>
 
-            {refreshing && (
-              <motion.div
-                className="flex items-center gap-1.5 text-xs text-muted-foreground"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-              >
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                <AnimatePresence mode="wait">
-                  <motion.span
-                    key={discoveryIndex}
-                    initial={{ opacity: 0, y: 4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    transition={{ duration: 0.2 }}
+                <Select value={subCategory} onValueChange={onSubCategoryChange} disabled={!category || hasStarted || isFullProduct}>
+                  <SelectTrigger className="h-8 w-[200px] bg-background/50 text-xs">
+                    <SelectValue placeholder="Product Areas" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {subCategoryNames.map((sc) => (
+                      <SelectItem key={sc} value={sc}>{sc}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                <Popover open={competitorPopoverOpen} onOpenChange={(open) => {
+                  setCompetitorPopoverOpen(open);
+                  if (open && subCategory && onDiscoverCompetitors) {
+                    onDiscoverCompetitors();
+                  }
+                }}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 w-[200px] justify-between bg-background/50 text-xs font-normal"
+                      disabled={!subCategory || hasStarted}
+                    >
+                      <span className="truncate">{competitorLabel}</span>
+                      {selectedCompetitors.length > 0 && !hasStarted && (
+                        <span className="ml-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-[10px] text-primary-foreground">
+                          {selectedCompetitors.length}
+                        </span>
+                      )}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[240px] p-2" align="start">
+                    <div className="mb-2 px-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                      Select up to 2 competitors
+                    </div>
+                    <div className="max-h-64 overflow-y-auto space-y-0.5">
+                      {/* Predefined competitors */}
+                      {PREDEFINED_COMPETITORS.map((name) => {
+                        const checked = selectedCompetitors.includes(name);
+                        const disabled = !checked && selectedCompetitors.length >= 2;
+                        return (
+                          <div
+                            key={name}
+                            role="button"
+                            tabIndex={disabled ? -1 : 0}
+                            aria-disabled={disabled}
+                            aria-pressed={checked}
+                            onClick={() => { if (!disabled) toggleCompetitor(name); }}
+                            onKeyDown={(e) => {
+                              if (disabled) return;
+                              if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleCompetitor(name); }
+                            }}
+                            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors ${
+                              checked ? "bg-primary/10 text-foreground" : disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer hover:bg-muted text-foreground"
+                            }`}
+                          >
+                            <Checkbox checked={checked} className="h-3.5 w-3.5" tabIndex={-1} />
+                            <span className="truncate">{name}</span>
+                          </div>
+
+                        );
+                      })}
+
+                      {/* Separator + discovered competitors */}
+                      {discoveredCompetitors.length > 0 && (
+                        <>
+                          <div className="my-1.5 border-t border-border" />
+                          <div className="px-1 pb-1 text-[9px] font-medium text-muted-foreground uppercase tracking-wider">
+                            Discovered
+                          </div>
+                          {discoveredCompetitors
+                            .filter((c) => !PREDEFINED_COMPETITORS.includes(c.name))
+                            .map((comp) => {
+                              const checked = selectedCompetitors.includes(comp.name);
+                              const disabled = !checked && selectedCompetitors.length >= 2;
+                              return (
+                                <div
+                                  key={comp.name}
+                                  role="button"
+                                  tabIndex={disabled ? -1 : 0}
+                                  aria-disabled={disabled}
+                                  aria-pressed={checked}
+                                  onClick={() => { if (!disabled) toggleCompetitor(comp.name); }}
+                                  onKeyDown={(e) => {
+                                    if (disabled) return;
+                                    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleCompetitor(comp.name); }
+                                  }}
+                                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors ${
+                                    checked ? "bg-primary/10 text-foreground" : disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer hover:bg-muted text-foreground"
+                                  }`}
+                                >
+                                  <Checkbox checked={checked} className="h-3.5 w-3.5" tabIndex={-1} />
+                                  <span className="truncate">{comp.name}</span>
+                                </div>
+
+                              );
+                            })}
+                        </>
+                      )}
+
+                      {/* Scanning indicator */}
+                      {refreshing && (
+                        <div className="flex items-center gap-1.5 px-2 py-1.5 text-[10px] text-muted-foreground">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          <span>Scanning for more competitors...</span>
+                        </div>
+                      )}
+                    </div>
+                    {selectedCompetitors.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1 border-t border-border pt-2">
+                        {selectedCompetitors.map(name => (
+                          <span key={name} className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-foreground">
+                            {name}
+                            <button onClick={() => toggleCompetitor(name)} className="hover:text-destructive">
+                              <X className="h-2.5 w-2.5" />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </PopoverContent>
+                </Popover>
+
+
+
+                {showLetsGo && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ delay: 0.1, duration: 0.25 }}
                   >
-                    {DISCOVERY_STEPS[discoveryIndex]}
-                  </motion.span>
-                </AnimatePresence>
-              </motion.div>
-            )}
-
-            {showLetsGo && (
-              <motion.div
-                initial={{ opacity: 0, scale: 0.9 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: 0.1, duration: 0.25 }}
-              >
-                <Button onClick={onLetsGo} size="sm" className="gap-2 glow-pulse" disabled={!hasContext}>
-                  <Rocket className="h-4 w-4" />
-                  Let's Go!
-                </Button>
-              </motion.div>
-            )}
-          </div>
+                    <Button onClick={onLetsGo} size="sm" className="gap-2 glow-pulse" disabled={!hasContext}>
+                      <Rocket className="h-4 w-4" />
+                      Let's Go!
+                    </Button>
+                  </motion.div>
+                )}
+              </div>
+            </div>
+          )}
 
           <AnimatePresence>
             {showChatInput && (
@@ -527,9 +789,9 @@ const ChatInterface = ({
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
-                  placeholder="Ask a follow-up question..."
+                  placeholder={directChatMode && !hasStarted ? "Type your research question..." : "Ask a follow-up question..."}
                   disabled={loading}
-                  className="bg-background/50"
+                  className="bg-background/85 backdrop-blur-xl"
                 />
                 <Button onClick={handleSend} disabled={!input.trim() || loading} size="icon">
                   <Send className="h-4 w-4" />
@@ -538,7 +800,7 @@ const ChatInterface = ({
             )}
           </AnimatePresence>
         </div>
-      </motion.div>
+      </div>
     </div>
   );
 };

@@ -1,5 +1,5 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { requireAuth } from "../_shared/auth.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { firecrawlFetch, hasFirecrawlKey } from "../_shared/firecrawl-keys.ts";
 
 const corsHeaders = {
@@ -23,6 +23,10 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  // --- Auth guard (shared): valid user JWT or service-role key required ---
+  const authError = await requireAuth(req, corsHeaders);
+  if (authError) return authError;
 
   try {
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -155,7 +159,7 @@ Deno.serve(async (req) => {
                       "Content-Type": "application/json",
                     },
                     body: JSON.stringify({
-                      model: "google/gemini-2.5-flash-lite",
+                      model: "openai/gpt-5.5",
                       messages: [
                         {
                           role: "system",
@@ -163,8 +167,7 @@ Deno.serve(async (req) => {
                         },
                         { role: "user", content: markdown.slice(0, 30000) },
                       ],
-                      max_tokens: 2000,
-                      temperature: 0.1,
+                      max_completion_tokens: 2000,
                     }),
                   }
                 );
@@ -188,7 +191,7 @@ Deno.serve(async (req) => {
                   {
                     method: "POST",
                     headers: {
-                      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+                      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
                       "Content-Type": "application/json",
                     },
                     body: JSON.stringify({

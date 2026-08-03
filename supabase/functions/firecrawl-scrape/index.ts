@@ -1,4 +1,4 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { requireAuth } from "../_shared/auth.ts";
 import { firecrawlFetch, hasFirecrawlKey } from "../_shared/firecrawl-keys.ts";
 
 const corsHeaders = {
@@ -10,6 +10,10 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  // --- Auth guard (shared): valid user JWT or service-role key required ---
+  const authError = await requireAuth(req, corsHeaders);
+  if (authError) return authError;
 
   try {
     const { url, options } = await req.json();
@@ -28,9 +32,41 @@ Deno.serve(async (req) => {
       );
     }
 
-    let formattedUrl = url.trim();
+    let formattedUrl = String(url).trim();
+    if (formattedUrl.length > 2048) {
+      return new Response(
+        JSON.stringify({ success: false, error: "URL too long" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
     if (!formattedUrl.startsWith("http://") && !formattedUrl.startsWith("https://")) {
       formattedUrl = `https://${formattedUrl}`;
+    }
+
+    // SSRF guard: only allow public http(s) hosts; block internal/loopback/metadata targets.
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(formattedUrl);
+    } catch {
+      return new Response(
+        JSON.stringify({ success: false, error: "Invalid URL" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    const host = parsedUrl.hostname.toLowerCase();
+    const isBlockedHost =
+      host === "localhost" || host.endsWith(".localhost") ||
+      host === "0.0.0.0" || host === "[::1]" || host === "::1" ||
+      host === "metadata.google.internal" || host === "169.254.169.254" ||
+      /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
+      /^169\.254\./.test(host) ||
+      host.endsWith(".internal") || host.endsWith(".local");
+    if ((parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") || isBlockedHost) {
+      return new Response(
+        JSON.stringify({ success: false, error: "URL not allowed" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
     }
 
     console.log("Scraping URL:", formattedUrl);

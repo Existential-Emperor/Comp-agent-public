@@ -1,0 +1,1 @@
+ALTER TABLE public.user_feedback ADD COLUMN username TEXT;

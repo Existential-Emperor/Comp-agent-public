@@ -14,6 +14,48 @@ export type Database = {
   }
   public: {
     Tables: {
+      adaptive_planning_kb: {
+        Row: {
+          content: string
+          content_hash: string
+          created_at: string
+          doc_version: string | null
+          id: string
+          search_tsv: unknown
+          section_path: string | null
+          source_doc: string
+          title: string | null
+          topics: string[]
+          updated_at: string
+        }
+        Insert: {
+          content: string
+          content_hash: string
+          created_at?: string
+          doc_version?: string | null
+          id?: string
+          search_tsv?: unknown
+          section_path?: string | null
+          source_doc: string
+          title?: string | null
+          topics?: string[]
+          updated_at?: string
+        }
+        Update: {
+          content?: string
+          content_hash?: string
+          created_at?: string
+          doc_version?: string | null
+          id?: string
+          search_tsv?: unknown
+          section_path?: string | null
+          source_doc?: string
+          title?: string | null
+          topics?: string[]
+          updated_at?: string
+        }
+        Relationships: []
+      }
       agent_traces: {
         Row: {
           agent_source: string
@@ -33,6 +75,7 @@ export type Database = {
           metadata: Json | null
           model_used: string | null
           overall_score: number | null
+          pipeline_version: string
           prompt_tokens: number | null
           raw_llm_output: string | null
           retrieved_documents: Json | null
@@ -65,6 +108,7 @@ export type Database = {
           metadata?: Json | null
           model_used?: string | null
           overall_score?: number | null
+          pipeline_version?: string
           prompt_tokens?: number | null
           raw_llm_output?: string | null
           retrieved_documents?: Json | null
@@ -97,6 +141,7 @@ export type Database = {
           metadata?: Json | null
           model_used?: string | null
           overall_score?: number | null
+          pipeline_version?: string
           prompt_tokens?: number | null
           raw_llm_output?: string | null
           retrieved_documents?: Json | null
@@ -164,6 +209,69 @@ export type Database = {
           metadata?: Json | null
           notified?: boolean
           service?: string
+        }
+        Relationships: []
+      }
+      chat_jobs: {
+        Row: {
+          created_at: string
+          diagnostics: Json
+          error: Json | null
+          eval_scores: Json | null
+          final_content_length: number | null
+          gateway_retry_count: number
+          id: string
+          judge_scores: Json | null
+          last_event: Json | null
+          last_event_at: string | null
+          last_seq: number
+          message_id: string | null
+          request: Json
+          status: string
+          thread_id: string | null
+          trace_id: string | null
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          diagnostics?: Json
+          error?: Json | null
+          eval_scores?: Json | null
+          final_content_length?: number | null
+          gateway_retry_count?: number
+          id?: string
+          judge_scores?: Json | null
+          last_event?: Json | null
+          last_event_at?: string | null
+          last_seq?: number
+          message_id?: string | null
+          request?: Json
+          status?: string
+          thread_id?: string | null
+          trace_id?: string | null
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          diagnostics?: Json
+          error?: Json | null
+          eval_scores?: Json | null
+          final_content_length?: number | null
+          gateway_retry_count?: number
+          id?: string
+          judge_scores?: Json | null
+          last_event?: Json | null
+          last_event_at?: string | null
+          last_seq?: number
+          message_id?: string | null
+          request?: Json
+          status?: string
+          thread_id?: string | null
+          trace_id?: string | null
+          updated_at?: string
+          user_id?: string
         }
         Relationships: []
       }
@@ -315,6 +423,128 @@ export type Database = {
         }
         Relationships: []
       }
+      competitor_product_area_mappings: {
+        Row: {
+          category: string
+          competitor_id: string
+          confidence: number | null
+          created_at: string
+          id: string
+          rationale: string | null
+          sub_category: string
+        }
+        Insert: {
+          category: string
+          competitor_id: string
+          confidence?: number | null
+          created_at?: string
+          id?: string
+          rationale?: string | null
+          sub_category: string
+        }
+        Update: {
+          category?: string
+          competitor_id?: string
+          confidence?: number | null
+          created_at?: string
+          id?: string
+          rationale?: string | null
+          sub_category?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "competitor_product_area_mappings_competitor_id_fkey"
+            columns: ["competitor_id"]
+            isOneToOne: false
+            referencedRelation: "competitor_profiles"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      competitor_profiles: {
+        Row: {
+          category: string | null
+          created_at: string
+          extra: Json
+          founder: string | null
+          funding: string | null
+          id: string
+          links: Json
+          market_focus: string | null
+          market_size: string | null
+          momentum: string | null
+          name: string
+          product_focus: string | null
+          segments: string[]
+          source: string
+          updated_at: string
+          website: string | null
+        }
+        Insert: {
+          category?: string | null
+          created_at?: string
+          extra?: Json
+          founder?: string | null
+          funding?: string | null
+          id?: string
+          links?: Json
+          market_focus?: string | null
+          market_size?: string | null
+          momentum?: string | null
+          name: string
+          product_focus?: string | null
+          segments?: string[]
+          source?: string
+          updated_at?: string
+          website?: string | null
+        }
+        Update: {
+          category?: string | null
+          created_at?: string
+          extra?: Json
+          founder?: string | null
+          funding?: string | null
+          id?: string
+          links?: Json
+          market_focus?: string | null
+          market_size?: string | null
+          momentum?: string | null
+          name?: string
+          product_focus?: string | null
+          segments?: string[]
+          source?: string
+          updated_at?: string
+          website?: string | null
+        }
+        Relationships: []
+      }
+      competitor_tenant_index: {
+        Row: {
+          competitor: string
+          created_at: string
+          id: string
+          observed_hostname: string
+          source: string
+          tenant_slug: string
+        }
+        Insert: {
+          competitor: string
+          created_at?: string
+          id?: string
+          observed_hostname: string
+          source?: string
+          tenant_slug: string
+        }
+        Update: {
+          competitor?: string
+          created_at?: string
+          id?: string
+          observed_hostname?: string
+          source?: string
+          tenant_slug?: string
+        }
+        Relationships: []
+      }
       competitors: {
         Row: {
           category: string
@@ -399,6 +629,51 @@ export type Database = {
         }
         Relationships: []
       }
+      customers: {
+        Row: {
+          country: string | null
+          created_at: string
+          customer_external_id: string
+          customer_name: string
+          customer_url: string | null
+          id: string
+          last_checked_at: string | null
+          match_details: Json | null
+          match_status: string
+          matched_competitors: string[]
+          updated_at: string
+          valid_domains: string[]
+        }
+        Insert: {
+          country?: string | null
+          created_at?: string
+          customer_external_id: string
+          customer_name: string
+          customer_url?: string | null
+          id?: string
+          last_checked_at?: string | null
+          match_details?: Json | null
+          match_status?: string
+          matched_competitors?: string[]
+          updated_at?: string
+          valid_domains?: string[]
+        }
+        Update: {
+          country?: string | null
+          created_at?: string
+          customer_external_id?: string
+          customer_name?: string
+          customer_url?: string | null
+          id?: string
+          last_checked_at?: string | null
+          match_details?: Json | null
+          match_status?: string
+          matched_competitors?: string[]
+          updated_at?: string
+          valid_domains?: string[]
+        }
+        Relationships: []
+      }
       evaluation_scores: {
         Row: {
           category: string
@@ -454,6 +729,24 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      matcher_state: {
+        Row: {
+          id: number
+          running_since: string | null
+          updated_at: string
+        }
+        Insert: {
+          id: number
+          running_since?: string | null
+          updated_at?: string
+        }
+        Update: {
+          id?: number
+          running_since?: string | null
+          updated_at?: string
+        }
+        Relationships: []
       }
       media_assets: {
         Row: {
@@ -515,15 +808,85 @@ export type Database = {
         }
         Relationships: []
       }
+      news_ingestion_queue: {
+        Row: {
+          competitor_name: string
+          created_at: string
+          date_source: string | null
+          id: string
+          image_url: string | null
+          last_error: string | null
+          metadata: Json | null
+          needs_date_review: boolean
+          published_at: string | null
+          retry_count: number
+          run_id: string
+          snippet: string | null
+          source_name: string | null
+          source_url: string
+          status: string
+          summary: string | null
+          title: string | null
+          updated_at: string
+        }
+        Insert: {
+          competitor_name: string
+          created_at?: string
+          date_source?: string | null
+          id?: string
+          image_url?: string | null
+          last_error?: string | null
+          metadata?: Json | null
+          needs_date_review?: boolean
+          published_at?: string | null
+          retry_count?: number
+          run_id: string
+          snippet?: string | null
+          source_name?: string | null
+          source_url: string
+          status?: string
+          summary?: string | null
+          title?: string | null
+          updated_at?: string
+        }
+        Update: {
+          competitor_name?: string
+          created_at?: string
+          date_source?: string | null
+          id?: string
+          image_url?: string | null
+          last_error?: string | null
+          metadata?: Json | null
+          needs_date_review?: boolean
+          published_at?: string | null
+          retry_count?: number
+          run_id?: string
+          snippet?: string | null
+          source_name?: string | null
+          source_url?: string
+          status?: string
+          summary?: string | null
+          title?: string | null
+          updated_at?: string
+        }
+        Relationships: []
+      }
       news_items: {
         Row: {
           created_at: string
+          date_source: string | null
           fetched_at: string
           id: string
           image_url: string | null
           item_type: string
           metadata: Json | null
+          needs_date_review: boolean
           published_at: string | null
+          quality_genre_fit: number | null
+          quality_independence: number | null
+          quality_subjecthood: number | null
+          quality_substance: number | null
+          quality_total: number | null
           source_name: string | null
           source_url: string
           summary: string | null
@@ -531,12 +894,19 @@ export type Database = {
         }
         Insert: {
           created_at?: string
+          date_source?: string | null
           fetched_at?: string
           id?: string
           image_url?: string | null
           item_type?: string
           metadata?: Json | null
+          needs_date_review?: boolean
           published_at?: string | null
+          quality_genre_fit?: number | null
+          quality_independence?: number | null
+          quality_subjecthood?: number | null
+          quality_substance?: number | null
+          quality_total?: number | null
           source_name?: string | null
           source_url: string
           summary?: string | null
@@ -544,12 +914,19 @@ export type Database = {
         }
         Update: {
           created_at?: string
+          date_source?: string | null
           fetched_at?: string
           id?: string
           image_url?: string | null
           item_type?: string
           metadata?: Json | null
+          needs_date_review?: boolean
           published_at?: string | null
+          quality_genre_fit?: number | null
+          quality_independence?: number | null
+          quality_subjecthood?: number | null
+          quality_substance?: number | null
+          quality_total?: number | null
           source_name?: string | null
           source_url?: string
           summary?: string | null
@@ -617,6 +994,54 @@ export type Database = {
         }
         Relationships: []
       }
+      roadmap_kb: {
+        Row: {
+          chunk_count: number
+          created_at: string
+          file_size_bytes: number
+          id: string
+          metadata: Json | null
+          mime_type: string
+          original_filename: string
+          parsed_content: string
+          parsed_content_format: string
+          search_tsv: unknown
+          storage_path: string
+          updated_at: string
+          uploaded_by: string
+        }
+        Insert: {
+          chunk_count?: number
+          created_at?: string
+          file_size_bytes: number
+          id?: string
+          metadata?: Json | null
+          mime_type: string
+          original_filename: string
+          parsed_content: string
+          parsed_content_format?: string
+          search_tsv?: unknown
+          storage_path: string
+          updated_at?: string
+          uploaded_by: string
+        }
+        Update: {
+          chunk_count?: number
+          created_at?: string
+          file_size_bytes?: number
+          id?: string
+          metadata?: Json | null
+          mime_type?: string
+          original_filename?: string
+          parsed_content?: string
+          parsed_content_format?: string
+          search_tsv?: unknown
+          storage_path?: string
+          updated_at?: string
+          uploaded_by?: string
+        }
+        Relationships: []
+      }
       saved_items: {
         Row: {
           id: string
@@ -645,6 +1070,72 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      synthesis_cache: {
+        Row: {
+          artifact: Json
+          created_at: string
+          entity: string
+          evidence_hash: string
+          expires_at: string | null
+          id: string
+          model: string
+          prompt_version: string
+          scope: string
+          section_id: string
+        }
+        Insert: {
+          artifact: Json
+          created_at?: string
+          entity: string
+          evidence_hash: string
+          expires_at?: string | null
+          id?: string
+          model: string
+          prompt_version: string
+          scope: string
+          section_id: string
+        }
+        Update: {
+          artifact?: Json
+          created_at?: string
+          entity?: string
+          evidence_hash?: string
+          expires_at?: string | null
+          id?: string
+          model?: string
+          prompt_version?: string
+          scope?: string
+          section_id?: string
+        }
+        Relationships: []
+      }
+      user_feedback: {
+        Row: {
+          created_at: string
+          feedback_text: string
+          id: string
+          image_urls: string[] | null
+          user_id: string
+          username: string | null
+        }
+        Insert: {
+          created_at?: string
+          feedback_text: string
+          id?: string
+          image_urls?: string[] | null
+          user_id: string
+          username?: string | null
+        }
+        Update: {
+          created_at?: string
+          feedback_text?: string
+          id?: string
+          image_urls?: string[] | null
+          user_id?: string
+          username?: string | null
+        }
+        Relationships: []
       }
       user_roles: {
         Row: {
@@ -719,6 +1210,11 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      acquire_match_lease: {
+        Args: { _lease_minutes?: number }
+        Returns: boolean
+      }
+      apply_customer_matches: { Args: { _rows: Json }; Returns: number }
       has_role: {
         Args: {
           _role: Database["public"]["Enums"]["app_role"]
@@ -726,6 +1222,38 @@ export type Database = {
         }
         Returns: boolean
       }
+      is_workday_user: { Args: never; Returns: boolean }
+      release_match_lease: { Args: never; Returns: undefined }
+      search_adaptive_kb: {
+        Args: { max_rows?: number; q: string }
+        Returns: {
+          content: string
+          id: string
+          rank: number
+          section_path: string
+          source_doc: string
+          title: string
+          topics: string[]
+        }[]
+      }
+      search_roadmap_kb: {
+        Args: { max_rows?: number; q: string }
+        Returns: {
+          content: string
+          id: string
+          rank: number
+          section_path: string
+          source_doc: string
+          title: string
+        }[]
+      }
+      show_limit: { Args: never; Returns: number }
+      show_trgm: { Args: { "": string }; Returns: string[] }
+      stamp_trace_client_metadata: {
+        Args: { _client_envelope: Json; _trace_id: string }
+        Returns: undefined
+      }
+      verify_cron_secret: { Args: { _s: string }; Returns: boolean }
     }
     Enums: {
       app_role: "admin" | "moderator" | "user"

@@ -1,4 +1,4 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { requireAuth } from "../_shared/auth.ts";
 import { monitoredFetch } from "../_shared/monitored-fetch.ts";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -10,12 +10,22 @@ Deno.serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // --- Auth guard (shared): valid user JWT or service-role key required ---
+  const authError = await requireAuth(req, corsHeaders);
+  if (authError) return authError;
+
   try {
     const { query, maxResults, includeDomains } = await req.json();
 
-    if (!query) {
+    if (!query || typeof query !== "string") {
       return new Response(
         JSON.stringify({ success: false, error: "Query is required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    if (query.length > 2000 || (includeDomains !== undefined && !Array.isArray(includeDomains))) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Invalid input" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
